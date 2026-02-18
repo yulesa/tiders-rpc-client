@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arrow = "56"
+anyhow = "1"
+cherry-evm-schema = { path = "../../cherry-core/evm-schema" }
+futures-lite = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tokio-stream = "0.1"
 
 # ============================================
 # Using rust-magic-linter STANDARD PRESET so agents follows rust best practices
@@ -46,3 +52,4 @@ must_use_candidate = "allow"
 module_name_repetitions = "allow"
 similar_names = "allow"
 too_many_lines = "allow"
+struct_excessive_bools = "allow"
