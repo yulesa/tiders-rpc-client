@@ -112,11 +112,8 @@ async fn run_historical(
         match fetch_logs(provider, log_requests, from_block, to_block).await {
             Ok(logs) => {
                 let logs_len = logs.len();
-
-                if logs_len > 0 {
-                    info!("Fetched {logs_len} logs between blocks {from_block}-{to_block}");
-                }
-
+                info!("Fetched {logs_len} logs between blocks {from_block}-{to_block}");
+                
                 let logs_batch = logs_to_record_batch(&logs);
                 let response = ArrowResponse::with_logs(logs_batch);
 

@@ -6,11 +6,9 @@ use arrow::record_batch::RecordBatch;
 use futures_lite::Stream;
 
 use crate::config::{ClientConfig, StreamConfig};
-use crate::convert::{clamp_to_block, logs_to_record_batch};
-use crate::query::emit_unimplemented_warnings;
 use crate::query::Query;
 use crate::response::ArrowResponse;
-use crate::rpc::{fetch_logs, start_log_stream, RpcProvider};
+use crate::rpc::{start_log_stream, RpcProvider};
 
 pub type DataStream = Pin<Box<dyn Stream<Item = Result<ArrowResponse>> + Send + Sync>>;
 
@@ -31,30 +29,6 @@ impl Client {
 
     pub fn config(&self) -> &ClientConfig {
         &self.config
-    }
-
-    /// Execute a one-shot query and return the Arrow response.
-    ///
-    /// Fetches logs for the entire `[from_block, to_block]` range (clamped
-    /// to the current head if `to_block` is `None`).
-    pub async fn query(&self, query: &Query) -> Result<ArrowResponse> {
-        emit_unimplemented_warnings(query);
-
-        let to_block = match query.to_block {
-            Some(to) => to,
-            None => self
-                .provider
-                .get_block_number()
-                .await
-                .context("failed to get current block number")?,
-        };
-
-        let to_block = clamp_to_block(query.from_block, to_block, self.config.max_block_range);
-
-        let logs = fetch_logs(&self.provider, &query.logs, query.from_block, to_block).await?;
-
-        let logs_batch = logs_to_record_batch(&logs);
-        Ok(ArrowResponse::with_logs(logs_batch))
     }
 
     /// Start a streaming query that yields `ArrowResponse` chunks.
@@ -85,7 +59,6 @@ mod tests {
     use std::path::Path;
 
     use alloy::primitives::{address, b256};
-    use arrow::array::Array;
     use arrow::record_batch::RecordBatch;
     use futures_lite::StreamExt;
     use parquet::arrow::ArrowWriter;
@@ -100,8 +73,6 @@ mod tests {
     /// Root of the cherry-rpc-client repository (one level above `rust/`).
     const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
-    /// Write a slice of `RecordBatch`es to a Parquet file, overwriting if it
-    /// already exists. Panics on I/O or encoding errors (test-only helper).
     fn write_parquet(path: &Path, batches: &[RecordBatch]) {
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return;
@@ -118,21 +89,6 @@ mod tests {
         writer
             .close()
             .unwrap_or_else(|e| panic!("ArrowWriter::close: {e}"));
-    }
-
-    /// Save all non-empty tables from an `ArrowResponse` to Parquet files under
-    /// `<repo_root>/<prefix>_<table>.parquet`, overwriting on every run.
-    fn save_response_parquet(resp: &ArrowResponse, prefix: &str) {
-        let root = Path::new(REPO_ROOT);
-        for (name, batch) in [
-            ("blocks", &resp.blocks),
-            ("transactions", &resp.transactions),
-            ("logs", &resp.logs),
-            ("traces", &resp.traces),
-        ] {
-            let path = root.join(format!("data/{prefix}_{name}.parquet"));
-            write_parquet(&path, &[batch.clone()]);
-        }
     }
 
     /// Tenderly free Ethereum mainnet gateway (same default as rindexer examples).
@@ -167,13 +123,42 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to create client: {e}"))
     }
 
-    /// Build a query for Rocket Pool rETH Transfer logs in a small block range,
-    /// with all log fields requested, plus one field from each of the other tables
-    /// (block, transaction, trace) to trigger the unimplemented-pipeline warnings.
-    fn reth_transfer_query(from_block: u64, to_block: u64) -> Query {
-        Query {
+    #[test]
+    fn client_creation_succeeds() {
+        let _client = make_client();
+    }
+
+    #[test]
+    fn response_to_btree_maps_keys() {
+        let resp = ArrowResponse::empty();
+        let btree = Client::response_to_btree(resp);
+        assert_eq!(btree.len(), 4);
+        assert!(btree.contains_key("blocks"));
+        assert!(btree.contains_key("transactions"));
+        assert!(btree.contains_key("logs"));
+        assert!(btree.contains_key("traces"));
+    }
+
+    /// Streaming query: fetches the last 5000 blocks up to the current head
+    /// (`stop_on_head: true`) and saves all log chunks to Parquet.
+    #[tokio::test]
+    async fn stream_reth_transfer_logs() {
+        setup_tracing();
+        let client = make_client();
+
+        // Resolve the current head and log it.
+        let latest_block = client
+            .provider
+            .get_block_number()
+            .await
+            .unwrap_or_else(|e| panic!("failed to get block number: {e}"));
+        tracing::info!("Latest block: {latest_block}");
+
+        let from_block = latest_block.saturating_sub(5_000);
+
+        let query = Query {
             from_block,
-            to_block: Some(to_block),
+            to_block: Some(latest_block),
             include_all_blocks: false,
             logs: vec![LogRequest {
                 address: vec![reth_address()],
@@ -210,131 +195,8 @@ mod tests {
                     ..TraceFields::default()
                 },
             },
-        }
-    }
+        };
 
-    #[test]
-    fn client_creation_succeeds() {
-        let _client = make_client();
-    }
-
-    #[test]
-    fn response_to_btree_maps_keys() {
-        let resp = ArrowResponse::empty();
-        let btree = Client::response_to_btree(resp);
-        assert_eq!(btree.len(), 4);
-        assert!(btree.contains_key("blocks"));
-        assert!(btree.contains_key("transactions"));
-        assert!(btree.contains_key("logs"));
-        assert!(btree.contains_key("traces"));
-    }
-
-    /// One-shot query: fetches Rocket Pool rETH Transfer logs for blocks
-    /// 18_600_000..18_601_000 and validates the Arrow output.
-    #[tokio::test]
-    async fn query_reth_transfer_logs() {
-        setup_tracing();
-        let client = make_client();
-        let query = reth_transfer_query(18_600_000, 18_601_000);
-
-        let resp = client
-            .query(&query)
-            .await
-            .unwrap_or_else(|e| panic!("query failed: {e}"));
-
-        // --- Logs should be populated ---
-        assert!(
-            resp.logs.num_rows() > 0,
-            "expected Transfer logs in block range 18_600_000..18_601_000"
-        );
-
-        // Schema must match cherry-evm-schema.
-        assert_eq!(
-            resp.logs.schema().as_ref(),
-            &cherry_evm_schema::logs_schema(),
-        );
-
-        // --- Unimplemented tables should be empty (null columns) ---
-        assert_eq!(resp.blocks.num_rows(), 0);
-        assert_eq!(resp.transactions.num_rows(), 0);
-        assert_eq!(resp.traces.num_rows(), 0);
-
-        // --- Validate log data ---
-
-        // block_numbers should be within the requested range.
-        let block_nums = resp
-            .logs
-            .column_by_name("block_number")
-            .and_then(|c| c.as_any().downcast_ref::<arrow::array::UInt64Array>())
-            .unwrap_or_else(|| panic!("block_number column missing or wrong type"));
-
-        let expected_address = reth_address().0;
-        let expected_topic0 = transfer_topic0().0;
-
-        for i in 0..block_nums.len() {
-            if !block_nums.is_null(i) {
-                let bn = block_nums.value(i);
-                assert!(
-                    (18_600_000..=18_601_000).contains(&bn),
-                    "block_number {bn} out of requested range"
-                );
-            }
-        }
-
-        // Every log address should be the rETH contract.
-        let addresses = resp
-            .logs
-            .column_by_name("address")
-            .and_then(|c| c.as_any().downcast_ref::<arrow::array::BinaryArray>())
-            .unwrap_or_else(|| panic!("address column missing or wrong type"));
-
-        for i in 0..addresses.len() {
-            if !addresses.is_null(i) {
-                assert_eq!(
-                    addresses.value(i),
-                    &expected_address,
-                    "log {i} has unexpected address"
-                );
-            }
-        }
-
-        // Every topic0 should be the Transfer signature.
-        let topic0s = resp
-            .logs
-            .column_by_name("topic0")
-            .and_then(|c| c.as_any().downcast_ref::<arrow::array::BinaryArray>())
-            .unwrap_or_else(|| panic!("topic0 column missing or wrong type"));
-
-        for i in 0..topic0s.len() {
-            if !topic0s.is_null(i) {
-                assert_eq!(
-                    topic0s.value(i),
-                    &expected_topic0,
-                    "log {i} has unexpected topic0"
-                );
-            }
-        }
-
-        // next_block() should return something > from_block.
-        let next = resp
-            .next_block()
-            .unwrap_or_else(|e| panic!("next_block() failed: {e}"));
-        assert!(
-            next.is_some(),
-            "next_block() should not be None when logs are present"
-        );
-
-        // Save results to parquet files.
-        save_response_parquet(&resp, "query");
-    }
-
-    /// Streaming query: fetches the same block range via `stream()` with
-    /// `stop_on_head = true` so the stream terminates after historical data.
-    #[tokio::test]
-    async fn stream_reth_transfer_logs() {
-        setup_tracing();
-        let client = make_client();
-        let query = reth_transfer_query(18_600_000, 18_601_000);
         let stream_config = StreamConfig {
             stop_on_head: true,
             buffer_size: 4,
