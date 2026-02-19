@@ -5,7 +5,7 @@
 //! (fetch_logs.rs:1024-1039), and `halved_block_number()` (helpers/evm_log.rs:141-144).
 
 use regex::Regex;
-use tracing::{debug, warn};
+use log::{debug, warn};
 
 /// Result of attempting to parse an error for a suggested block range.
 #[derive(Debug)]
@@ -16,6 +16,9 @@ pub struct RetryBlockRange {
     /// requests. Only populated when the provider does NOT give block range
     /// hints (i.e. the slow-provider path).
     pub max_block_range: Option<u64>,
+    /// If true, the caller should wait briefly before retrying (transient
+    /// network overload rather than a block-range limit).
+    pub backoff: bool,
 }
 
 /// Clamp `to_block` based on `from_block + max_block_range`, never exceeding
@@ -57,7 +60,16 @@ pub fn retry_with_block_range(
     to_block: u64,
     max_block_range: Option<u64>,
 ) -> Option<RetryBlockRange> {
+    warn!("Attempt to parse an RPC block range error (blocks {from_block}-{to_block}): {error_message}");
     let error_lower = truncate_and_lowercase(error_message, 5000);
+
+    // Hard connectivity failures are not recoverable by changing the block range.
+    if error_lower.contains("connection refused")
+        || error_lower.contains("no such host")
+        || error_lower.contains("failed to lookup")
+    {
+        return None;
+    }
 
     // --- Alchemy ---
     // "this block range should work: [0x..., 0x...]"
@@ -89,6 +101,7 @@ pub fn retry_with_block_range(
             from: from_block,
             to: from_block + suggested,
             max_block_range: Some(suggested),
+            backoff: false,
         });
     }
 
@@ -106,6 +119,7 @@ pub fn retry_with_block_range(
             from: from_block,
             to: from_block + suggested,
             max_block_range: Some(suggested),
+            backoff: false,
         });
     }
 
@@ -117,15 +131,18 @@ pub fn retry_with_block_range(
             from: from_block,
             to: halved_block_range(from_block, to_block),
             max_block_range,
+            backoff: false,
         });
     }
 
     // --- Transient: sending error (overload) ---
+    // Sleep before retrying to avoid hammering an overloaded provider.
     if error_lower.contains("error sending request") {
         return Some(RetryBlockRange {
             from: from_block,
             to: halved_block_range(from_block, to_block),
             max_block_range,
+            backoff: true,
         });
     }
 
@@ -145,6 +162,7 @@ pub fn retry_with_block_range(
                 from: from_block,
                 to: halved_block_range(from_block, to_block),
                 max_block_range,
+                backoff: false,
             });
         }
 
@@ -159,6 +177,7 @@ pub fn retry_with_block_range(
             from: from_block,
             to: from_block + suggested,
             max_block_range: Some(suggested),
+            backoff: false,
         });
     }
 
@@ -192,17 +211,21 @@ fn try_parse_hex_range(
 
     if from > to {
         debug!("Provider returned inverted block range {from}..{to}, using from_block..{from}");
+        let suggested_range = from.saturating_sub(from_block);
         return Some(RetryBlockRange {
             from: from_block,
             to: from,
-            max_block_range,
+            max_block_range: Some(pick_min_range(max_block_range, suggested_range)),
+            backoff: false,
         });
     }
 
+    let suggested_range = to.saturating_sub(from);
     Some(RetryBlockRange {
         from,
         to,
-        max_block_range,
+        max_block_range: Some(pick_min_range(max_block_range, suggested_range)),
+        backoff: false,
     })
 }
 
@@ -220,6 +243,7 @@ fn try_parse_limited_to(
         from: from_block,
         to: from_block + suggested,
         max_block_range: Some(suggested),
+        backoff: false,
     })
 }
 
@@ -337,22 +361,26 @@ mod tests {
 
     #[test]
     fn alchemy_error_parsing() {
+        // 0x100=256, 0x200=512, range=256 → max_block_range becomes 256
         let msg = "this block range should work: [0x100, 0x200]";
         let result = retry_with_block_range(msg, 100, 1000, None);
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.map(|r| r.from), Some(0x100));
         assert_eq!(r.map(|r| r.to), Some(0x200));
+        assert_eq!(r.and_then(|r| r.max_block_range), Some(256));
     }
 
     #[test]
     fn infura_error_parsing() {
+        // from=10, to=255, range=245 → max_block_range becomes 245
         let msg = "try with this block range [0xa, 0xff]";
         let result = retry_with_block_range(msg, 5, 1000, None);
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.map(|r| r.from), Some(10));
         assert_eq!(r.map(|r| r.to), Some(255));
+        assert_eq!(r.and_then(|r| r.max_block_range), Some(245));
     }
 
     #[test]

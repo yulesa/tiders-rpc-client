@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use arrow::record_batch::RecordBatch;
 use futures_lite::Stream;
 
-use crate::config::{ClientConfig, StreamConfig};
+use crate::config::ClientConfig;
 use crate::query::Query;
 use crate::response::ArrowResponse;
 use crate::rpc::{start_log_stream, RpcProvider};
@@ -35,8 +35,8 @@ impl Client {
     ///
     /// The stream fetches logs in block-range batches (historical phase),
     /// then polls for new blocks (live phase) unless `stop_on_head` is set.
-    pub fn stream(&self, query: Query, stream_config: StreamConfig) -> Result<DataStream> {
-        let rx = start_log_stream(self.provider.clone(), query, stream_config);
+    pub fn stream(&self, query: Query) -> Result<DataStream> {
+        let rx = start_log_stream(self.provider.clone(), query, self.config.clone());
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
@@ -64,7 +64,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
-    use crate::config::{ClientConfig, StreamConfig};
+    use crate::config::ClientConfig;
     use crate::query::{
         Address, BlockFields, Fields, LogFields, LogRequest, Query, Topic, TraceFields,
         TransactionFields,
@@ -94,17 +94,13 @@ mod tests {
     /// Tenderly free Ethereum mainnet gateway (same default as rindexer examples).
     const RPC_URL: &str = "https://mainnet.gateway.tenderly.co";
 
-    /// Initialise a tracing subscriber so log output is visible when running
+    /// Initialise env_logger so log output is visible when running
     /// tests with `--nocapture`. Defaults to `info`; override with `RUST_LOG`.
-    /// Silently ignores the error if a subscriber has already been set by
-    /// another test in this process.
+    /// Silently ignores the error if a logger has already been set.
     fn setup_tracing() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_target(false)
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .parse_default_env()
             .try_init();
     }
 
@@ -119,8 +115,12 @@ mod tests {
     }
 
     fn make_client() -> Client {
-        Client::new(ClientConfig::new(RPC_URL.to_owned()))
-            .unwrap_or_else(|e| panic!("Failed to create client: {e}"))
+        Client::new(ClientConfig {
+            stop_on_head: true,
+            max_block_range: Some(500),
+            ..ClientConfig::new(RPC_URL.to_owned())
+        })
+        .unwrap_or_else(|e| panic!("Failed to create client: {e}"))
     }
 
     #[test]
@@ -152,7 +152,7 @@ mod tests {
             .get_block_number()
             .await
             .unwrap_or_else(|e| panic!("failed to get block number: {e}"));
-        tracing::info!("Latest block: {latest_block}");
+        log::info!("Latest block: {latest_block}");
 
         let from_block = latest_block.saturating_sub(5_000);
 
@@ -197,14 +197,8 @@ mod tests {
             },
         };
 
-        let stream_config = StreamConfig {
-            stop_on_head: true,
-            buffer_size: 4,
-            ..StreamConfig::default()
-        };
-
         let mut stream = client
-            .stream(query, stream_config)
+            .stream(query)
             .unwrap_or_else(|e| panic!("stream creation failed: {e}"));
 
         let mut total_log_rows = 0u64;

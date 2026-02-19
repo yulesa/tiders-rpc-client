@@ -14,12 +14,12 @@ regex = "1"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tokio-stream = "0.1"
-tracing = "0.1"
+log = "0.4"
 url = "2"
 
 [dev-dependencies]
 parquet = "56"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+env_logger = "0.11"
 
 # ============================================
 # Using rust-magic-linter STANDARD PRESET so agents follows rust best practices

@@ -3,7 +3,7 @@
 //! These mirror `cherry_ingest::evm::Query` but are owned by this crate
 //! so the RPC client can evolve independently.
 
-use tracing::warn;
+use log::warn;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Address(pub [u8; 20]);

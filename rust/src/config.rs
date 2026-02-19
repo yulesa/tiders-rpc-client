@@ -1,7 +1,7 @@
 use crate::query::TraceMethod;
 
-/// Configuration types for the RPC client.
-
+/// All configuration for the RPC client, including both connection settings
+/// and stream behaviour.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub url: String,
@@ -14,8 +14,12 @@ pub struct ClientConfig {
     pub max_concurrent_requests: Option<usize>,
     pub batch_size: Option<usize>,
     pub rpc_batch_size: Option<usize>,
-    pub max_block_range: Option<u64>,
     pub trace_method: Option<TraceMethod>,
+    pub stop_on_head: bool,
+    pub head_poll_interval_millis: u64,
+    pub buffer_size: usize,
+    pub reorg_safe_distance: u64,
+    pub max_block_range: Option<u64>,
 }
 
 impl ClientConfig {
@@ -33,21 +37,6 @@ impl ClientConfig {
             rpc_batch_size: None,
             max_block_range: None,
             trace_method: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct StreamConfig {
-    pub stop_on_head: bool,
-    pub head_poll_interval_millis: u64,
-    pub buffer_size: usize,
-    pub reorg_safe_distance: u64,
-}
-
-impl Default for StreamConfig {
-    fn default() -> Self {
-        Self {
             stop_on_head: false,
             head_poll_interval_millis: 1000,
             buffer_size: 10,

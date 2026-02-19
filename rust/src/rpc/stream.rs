@@ -8,9 +8,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rand::Rng;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use log::{debug, error, info, warn};
 
-use crate::config::StreamConfig;
+use crate::config::ClientConfig;
 use crate::convert::{
     clamp_to_block, halved_block_range, logs_to_record_batch, retry_with_block_range,
 };
@@ -28,13 +28,16 @@ use super::provider::RpcProvider;
 pub fn start_log_stream(
     provider: RpcProvider,
     query: Query,
-    stream_config: StreamConfig,
+    config: ClientConfig,
 ) -> mpsc::Receiver<Result<ArrowResponse>> {
-    let (tx, rx) = mpsc::channel(stream_config.buffer_size);
+    let (tx, rx) = mpsc::channel(config.buffer_size);
 
     tokio::spawn(async move {
-        if let Err(e) = run_stream(provider, query, stream_config, tx).await {
+        if let Err(e) = run_stream(provider, query, config, tx.clone()).await {
             error!("Log stream terminated with error: {e:#}");
+            // Send the error into the channel so the consumer sees it rather
+            // than a silent end-of-stream.
+            let _ = tx.send(Err(e)).await;
         }
     });
 
@@ -44,7 +47,7 @@ pub fn start_log_stream(
 async fn run_stream(
     provider: RpcProvider,
     query: Query,
-    stream_config: StreamConfig,
+    config: ClientConfig,
     tx: mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<()> {
     // Warn about unimplemented pipelines.
@@ -68,6 +71,7 @@ async fn run_stream(
         from_block,
         snapshot_latest_block,
         query.fields.log,
+        config.max_block_range,
         &tx,
     )
     .await?;
@@ -75,13 +79,13 @@ async fn run_stream(
     info!("Finished historical log indexing up to block {snapshot_latest_block}");
 
     // Live phase
-    if !stream_config.stop_on_head {
+    if !config.stop_on_head {
         run_live(
             &provider,
             &query.logs,
             next_block,
             query.fields.log,
-            &stream_config,
+            &config,
             &tx,
         )
         .await?;
@@ -98,9 +102,10 @@ async fn run_historical(
     start_from: u64,
     snapshot_latest_block: u64,
     _log_fields: crate::query::LogFields,
+    initial_max_block_range: Option<u64>,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
-    let original_max_range: Option<u64> = None; // Could come from ClientConfig in the future
+    let original_max_range = initial_max_block_range;
     let mut max_block_range = original_max_range;
     let mut from_block = start_from;
 
@@ -143,15 +148,28 @@ async fn run_historical(
                 if let Some(retry) =
                     retry_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
-                    debug!(
+                    warn!(
                         "Block range error, retrying with {}-{} (was {from_block}-{to_block})",
                         retry.from, retry.to
                     );
+                    if retry.backoff {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                     from_block = retry.from;
                     max_block_range = retry.max_block_range;
                     // Don't advance — retry with the new range.
                     // We set the clamp so the next iteration uses the new to.
                     continue;
+                }
+
+                // Hard connectivity failures are not recoverable — propagate immediately.
+                if err_str.contains("Connection refused")
+                    || err_str.contains("connection refused")
+                    || err_str.contains("No such host")
+                    || err_str.contains("no such host")
+                    || err_str.contains("failed to lookup")
+                {
+                    return Err(e);
                 }
 
                 // Unrecognized error: halve the range and retry.
@@ -174,10 +192,10 @@ async fn run_live(
     log_requests: &[LogRequest],
     start_from: u64,
     _log_fields: crate::query::LogFields,
-    stream_config: &StreamConfig,
+    config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<()> {
-    let poll_interval = Duration::from_millis(stream_config.head_poll_interval_millis);
+    let poll_interval = Duration::from_millis(config.head_poll_interval_millis);
     let mut from_block = start_from;
 
     loop {
@@ -193,7 +211,7 @@ async fn run_live(
         };
 
         // Apply reorg-safe distance.
-        let safe_head = head.saturating_sub(stream_config.reorg_safe_distance);
+        let safe_head = head.saturating_sub(config.reorg_safe_distance);
 
         if from_block > safe_head {
             debug!("At head (from_block={from_block}, safe_head={safe_head}), waiting...");
