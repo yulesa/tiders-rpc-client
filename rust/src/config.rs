@@ -5,7 +5,7 @@ use crate::query::TraceMethod;
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub url: String,
-    pub max_num_retries: usize,
+    pub max_num_retries: u32,
     pub retry_backoff_ms: u64,
     pub retry_base_ms: u64,
     pub retry_ceiling_ms: u64,
@@ -55,4 +55,3 @@ impl Default for StreamConfig {
         }
     }
 }
-
