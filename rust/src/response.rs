@@ -58,6 +58,16 @@ impl ArrowResponse {
             ..Self::empty()
         }
     }
+
+    /// Build a response with `blocks` and `transactions` populated.
+    /// Other tables (logs, traces) are empty with correct schemas.
+    pub fn with_blocks(blocks: RecordBatch, transactions: RecordBatch) -> Self {
+        Self {
+            blocks,
+            transactions,
+            ..Self::empty()
+        }
+    }
 }
 
 fn empty_batch(schema: &arrow::datatypes::Schema) -> RecordBatch {

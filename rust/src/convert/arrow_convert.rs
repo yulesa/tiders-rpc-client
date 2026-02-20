@@ -1,8 +1,73 @@
-//! Convert alloy `Log` objects to Arrow `RecordBatch` using `cherry_evm_schema::LogsBuilder`.
+//! Convert alloy RPC types to Arrow `RecordBatch` using `cherry_evm_schema` builders.
 
+use alloy::consensus::Transaction as TransactionTrait;
+use alloy::eips::Typed2718;
+use alloy::network::primitives::BlockTransactions;
+use alloy::network::{AnyRpcBlock, TransactionResponse};
+use alloy::primitives::{B256, U256};
 use alloy::rpc::types::Log;
+use arrow::array::builder::{BinaryBuilder, Decimal256Builder};
+use arrow::datatypes::i256;
 use arrow::record_batch::RecordBatch;
-use cherry_evm_schema::LogsBuilder;
+use cherry_evm_schema::{BlocksBuilder, LogsBuilder, TransactionsBuilder};
+
+/// Convert a `U256` (unsigned 256-bit) to Arrow's `i256` (signed 256-bit).
+///
+/// The `U256` value is stored in big-endian byte form and reinterpreted as a
+/// two's-complement signed integer.  Values that set the highest bit will
+/// appear negative, but for Ethereum quantities this is not expected to occur.
+fn u256_to_i256(val: U256) -> i256 {
+    let be_bytes: [u8; 32] = val.to_be_bytes();
+    i256::from_be_bytes(be_bytes)
+}
+
+/// Convert `u128` to `i256` for Decimal256 columns.
+#[expect(clippy::cast_possible_wrap)]
+fn u128_to_i256(val: u128) -> i256 {
+    // Ethereum u128 values (gas prices, fees) never exceed i128::MAX in practice.
+    i256::from_i128(val as i128)
+}
+
+/// Convert `u64` to `i256` for Decimal256 columns.
+fn u64_to_i256(val: u64) -> i256 {
+    i256::from_i128(i128::from(val))
+}
+
+/// Append an optional `B256` to a `BinaryBuilder`.
+fn append_optional_b256(builder: &mut BinaryBuilder, val: Option<B256>) {
+    match val {
+        Some(v) => builder.append_value(v.as_slice()),
+        None => builder.append_null(),
+    }
+}
+
+/// Append an optional `U256` to a `Decimal256Builder`.
+fn append_optional_u256(builder: &mut Decimal256Builder, val: Option<U256>) {
+    match val {
+        Some(v) => builder.append_value(u256_to_i256(v)),
+        None => builder.append_null(),
+    }
+}
+
+/// Append an optional `u128` to a `Decimal256Builder`.
+fn append_optional_u128(builder: &mut Decimal256Builder, val: Option<u128>) {
+    match val {
+        Some(v) => builder.append_value(u128_to_i256(v)),
+        None => builder.append_null(),
+    }
+}
+
+/// Append an optional `u64` to a `Decimal256Builder`.
+fn append_optional_u64_decimal(builder: &mut Decimal256Builder, val: Option<u64>) {
+    match val {
+        Some(v) => builder.append_value(u64_to_i256(v)),
+        None => builder.append_null(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logs
+// ---------------------------------------------------------------------------
 
 /// Convert a slice of alloy `Log`s into a `RecordBatch` matching `logs_schema()`.
 pub fn logs_to_record_batch(logs: &[Log]) -> RecordBatch {
@@ -65,12 +130,443 @@ pub fn logs_to_record_batch(logs: &[Log]) -> RecordBatch {
 }
 
 fn append_topic(
-    builder: &mut arrow::array::BinaryBuilder,
-    topic: Option<&alloy::primitives::B256>,
+    builder: &mut BinaryBuilder,
+    topic: Option<&B256>,
 ) {
     if let Some(t) = topic {
         builder.append_value(t.as_slice());
     } else {
         builder.append_null();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocks
+// ---------------------------------------------------------------------------
+
+/// Convert a slice of `AnyRpcBlock` into a `RecordBatch` matching `blocks_schema()`.
+///
+/// Each block produces one row.  Header fields are extracted from the
+/// consensus header accessible via `block.header.inner`.
+pub fn blocks_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
+    let mut b = BlocksBuilder::default();
+
+    for block in blocks {
+        let hdr = &block.inner.header.inner;
+
+        // number (u64)
+        b.number.append_value(hdr.number);
+
+        // hash (Binary) — from the RPC wrapper, not the consensus header
+        b.hash.append_value(block.inner.header.hash.as_slice());
+
+        // parent_hash
+        b.parent_hash.append_value(hdr.parent_hash.as_slice());
+
+        // nonce (B64 → Binary, optional on AnyHeader)
+        match hdr.nonce {
+            Some(nonce) => b.nonce.append_value(nonce.as_slice()),
+            None => b.nonce.append_null(),
+        }
+
+        // sha3_uncles (ommers_hash)
+        b.sha3_uncles.append_value(hdr.ommers_hash.as_slice());
+
+        // logs_bloom
+        b.logs_bloom.append_value(hdr.logs_bloom.as_slice());
+
+        // transactions_root
+        b.transactions_root
+            .append_value(hdr.transactions_root.as_slice());
+
+        // state_root
+        b.state_root.append_value(hdr.state_root.as_slice());
+
+        // receipts_root
+        b.receipts_root.append_value(hdr.receipts_root.as_slice());
+
+        // miner (beneficiary)
+        b.miner.append_value(hdr.beneficiary.as_slice());
+
+        // difficulty (U256 → Decimal256)
+        b.difficulty.append_value(u256_to_i256(hdr.difficulty));
+
+        // total_difficulty (Option<U256>)
+        append_optional_u256(
+            &mut b.total_difficulty,
+            block.inner.header.total_difficulty,
+        );
+
+        // extra_data
+        b.extra_data.append_value(hdr.extra_data.as_ref());
+
+        // size (Option<U256>)
+        append_optional_u256(&mut b.size, block.inner.header.size);
+
+        // gas_limit (u64 → Decimal256)
+        b.gas_limit.append_value(u64_to_i256(hdr.gas_limit));
+
+        // gas_used (u64 → Decimal256)
+        b.gas_used.append_value(u64_to_i256(hdr.gas_used));
+
+        // timestamp (u64 → Decimal256)
+        b.timestamp.append_value(u64_to_i256(hdr.timestamp));
+
+        // uncles (List<Binary>)
+        for uncle in &block.inner.uncles {
+            b.uncles.values().append_value(uncle.as_slice());
+        }
+        b.uncles.append(true);
+
+        // base_fee_per_gas (Option<u64> → Decimal256)
+        append_optional_u64_decimal(&mut b.base_fee_per_gas, hdr.base_fee_per_gas);
+
+        // blob_gas_used (Option<u64> → Decimal256)
+        append_optional_u64_decimal(&mut b.blob_gas_used, hdr.blob_gas_used);
+
+        // excess_blob_gas (Option<u64> → Decimal256)
+        append_optional_u64_decimal(&mut b.excess_blob_gas, hdr.excess_blob_gas);
+
+        // parent_beacon_block_root (Option<B256>)
+        append_optional_b256(
+            &mut b.parent_beacon_block_root,
+            hdr.parent_beacon_block_root,
+        );
+
+        // withdrawals_root (Option<B256>)
+        append_optional_b256(&mut b.withdrawals_root, hdr.withdrawals_root);
+
+        // withdrawals (Option<Withdrawals>)
+        append_withdrawals(&mut b.withdrawals, block);
+
+        // l1_block_number — not available from standard RPC, null
+        b.l1_block_number.append_null();
+
+        // send_count — not available from standard RPC, null
+        b.send_count.append_null();
+
+        // send_root — not available from standard RPC, null
+        b.send_root.append_null();
+
+        // mix_hash (Option<B256>)
+        append_optional_b256(&mut b.mix_hash, hdr.mix_hash);
+    }
+
+    b.finish()
+}
+
+/// Append one row to the withdrawals list builder.
+fn append_withdrawals(
+    wb: &mut cherry_evm_schema::WithdrawalsBuilder,
+    block: &AnyRpcBlock,
+) {
+    let list_builder = &mut wb.0;
+
+    if let Some(withdrawals) = &block.inner.withdrawals {
+        for w in withdrawals {
+            // The struct builder has sub-builders in order:
+            // 0: index (UInt64), 1: validator_index (UInt64),
+            // 2: address (Binary), 3: amount (Decimal256)
+            if let Some(fb) = list_builder
+                .values()
+                .field_builder::<arrow::array::builder::UInt64Builder>(0) { fb.append_value(w.index) }
+            if let Some(fb) = list_builder
+                .values()
+                .field_builder::<arrow::array::builder::UInt64Builder>(1) { fb.append_value(w.validator_index) }
+            if let Some(fb) = list_builder
+                .values()
+                .field_builder::<BinaryBuilder>(2) { fb.append_value(w.address.as_slice()) }
+            if let Some(fb) = list_builder
+                .values()
+                .field_builder::<Decimal256Builder>(3) { fb.append_value(u64_to_i256(w.amount)) }
+            list_builder.values().append(true);
+        }
+        list_builder.append(true);
+    } else {
+        list_builder.append(false); // null list
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------------
+
+/// Convert blocks (with full transaction objects) into a `RecordBatch`
+/// matching `transactions_schema()`.
+///
+/// Every transaction from every block produces one row.  Fields that require
+/// receipt data (`cumulative_gas_used`, `gas_used`, `status`, `contract_address`,
+/// `logs_bloom`, `root`) are left null — they will be populated by a future
+/// receipt-fetching pipeline.
+pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
+    let mut t = TransactionsBuilder::default();
+
+    for block in blocks {
+        let block_hash = block.inner.header.hash;
+        let block_number = block.inner.header.inner.number;
+
+        let BlockTransactions::Full(txns) = &block.inner.transactions else {
+            continue;
+        };
+
+        for tx in txns {
+            // block_hash
+            t.block_hash.append_value(block_hash.as_slice());
+
+            // block_number
+            t.block_number.append_value(block_number);
+
+            // from (sender)
+            t.from
+                .append_value(TransactionResponse::from(tx).as_slice());
+
+            // gas (gas_limit: u64 → Decimal256)
+            t.gas.append_value(u64_to_i256(tx.gas_limit()));
+
+            // gas_price (Option<u128>) — use the Transaction trait version
+            append_optional_u128(
+                &mut t.gas_price,
+                TransactionTrait::gas_price(tx),
+            );
+
+            // hash
+            t.hash.append_value(tx.tx_hash().as_slice());
+
+            // input
+            t.input.append_value(tx.input().as_ref());
+
+            // nonce (u64 → Decimal256)
+            t.nonce.append_value(u64_to_i256(tx.nonce()));
+
+            // to (TxKind: Create → null, Call(addr) → addr)
+            match TransactionTrait::to(tx) {
+                Some(addr) => t.to.append_value(addr.as_slice()),
+                None => t.to.append_null(),
+            }
+
+            // transaction_index
+            if let Some(idx) = tx.transaction_index() {
+                t.transaction_index.append_value(idx);
+            } else {
+                t.transaction_index.append_null();
+            }
+
+            // value (U256 → Decimal256)
+            t.value.append_value(u256_to_i256(tx.value()));
+
+            // Signature fields
+            append_signature_fields(&mut t, tx);
+
+            // max_priority_fee_per_gas (Option<u128>)
+            append_optional_u128(
+                &mut t.max_priority_fee_per_gas,
+                tx.max_priority_fee_per_gas(),
+            );
+
+            // max_fee_per_gas — only present on EIP-1559+ txs.
+            // The consensus trait returns u128 unconditionally; for legacy txs
+            // gas_price is Some while max_priority_fee_per_gas is None.
+            let gas_price = TransactionTrait::gas_price(tx);
+            if gas_price.is_none() {
+                // EIP-1559+ transaction (no legacy gas_price)
+                t.max_fee_per_gas
+                    .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
+            } else if tx.max_priority_fee_per_gas().is_some() {
+                // Has both gas_price and max_priority — EIP-1559 where
+                // gas_price is filled as effective_gas_price by the RPC.
+                t.max_fee_per_gas
+                    .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
+            } else {
+                t.max_fee_per_gas.append_null();
+            }
+
+            // chain_id (Option<u64> → Decimal256)
+            append_optional_u64_decimal(&mut t.chain_id, tx.chain_id());
+
+            // Receipt-only fields — null until receipt pipeline is implemented
+            t.cumulative_gas_used.append_null();
+            t.effective_gas_price.append_null();
+            t.gas_used.append_null();
+            t.contract_address.append_null();
+            t.logs_bloom.append_null();
+            t.root.append_null();
+            t.status.append_null();
+
+            // type (tx type byte)
+            t.type_.append_value(Typed2718::ty(tx));
+
+            // sighash (first 4 bytes of input, or null if input < 4 bytes)
+            let input = tx.input();
+            if input.len() >= 4 {
+                t.sighash.append_value(&input[..4]);
+            } else {
+                t.sighash.append_null();
+            }
+
+            // y_parity
+            append_y_parity(&mut t, tx);
+
+            // access_list
+            append_access_list(&mut t.access_list, tx);
+
+            // L1/Optimism fields — null
+            t.l1_fee.append_null();
+            t.l1_gas_price.append_null();
+            t.l1_gas_used.append_null();
+            t.l1_fee_scalar.append_null();
+            t.gas_used_for_l1.append_null();
+
+            // max_fee_per_blob_gas (Option<u128>)
+            append_optional_u128(
+                &mut t.max_fee_per_blob_gas,
+                tx.max_fee_per_blob_gas(),
+            );
+
+            // blob_versioned_hashes
+            if let Some(hashes) = tx.blob_versioned_hashes() {
+                for h in hashes {
+                    t.blob_versioned_hashes
+                        .values()
+                        .append_value(h.as_slice());
+                }
+                t.blob_versioned_hashes.append(true);
+            } else {
+                t.blob_versioned_hashes.append(false);
+            }
+
+            // More L2/OP fields — null
+            t.deposit_nonce.append_null();
+            t.blob_gas_price.append_null();
+            t.deposit_receipt_version.append_null();
+            t.blob_gas_used.append_null();
+            t.l1_base_fee_scalar.append_null();
+            t.l1_blob_base_fee.append_null();
+            t.l1_blob_base_fee_scalar.append_null();
+            t.l1_block_number.append_null();
+            t.mint.append_null();
+            t.source_hash.append_null();
+        }
+    }
+
+    t.finish()
+}
+
+/// Append v, r, s signature fields from the transaction.
+///
+/// For `AnyTxEnvelope::Ethereum` we can access the signature directly.
+/// For unknown envelope types, we append nulls.
+fn append_signature_fields(
+    t: &mut TransactionsBuilder,
+    tx: &alloy::network::AnyRpcTransaction,
+) {
+    // tx.inner = WithOtherFields<Transaction<AnyTxEnvelope>>
+    // tx.inner.inner = Recovered<AnyTxEnvelope> (Deref → AnyTxEnvelope)
+    // We go through as_envelope() when available, otherwise append nulls.
+    if let Some(envelope) = tx.as_envelope() {
+        let sig = envelope.signature();
+        // v: bool → u8 (0 or 1)
+        t.v.append_value(u8::from(sig.v()));
+        // r: U256 → Binary (32 bytes big-endian)
+        let r_bytes: [u8; 32] = sig.r().to_be_bytes();
+        t.r.append_value(r_bytes);
+        // s: U256 → Binary (32 bytes big-endian)
+        let s_bytes: [u8; 32] = sig.s().to_be_bytes();
+        t.s.append_value(s_bytes);
+    } else {
+        // Unknown envelope type — no signature available
+        t.v.append_null();
+        t.r.append_null();
+        t.s.append_null();
+    }
+}
+
+/// Append y_parity from the signature.
+fn append_y_parity(
+    t: &mut TransactionsBuilder,
+    tx: &alloy::network::AnyRpcTransaction,
+) {
+    match tx.as_envelope() {
+        Some(envelope) => {
+            t.y_parity.append_value(envelope.signature().v());
+        }
+        None => {
+            t.y_parity.append_null();
+        }
+    }
+}
+
+/// Append access_list for the transaction.
+fn append_access_list(
+    al_builder: &mut cherry_evm_schema::AccessListBuilder,
+    tx: &alloy::network::AnyRpcTransaction,
+) {
+    let list_builder = &mut al_builder.0;
+
+    if let Some(access_list) = tx.access_list() {
+        for item in access_list.iter() {
+            // Sub-builders: 0 = address (Binary), 1 = storage_keys (List<Binary>)
+            if let Some(fb) = list_builder
+                .values()
+                .field_builder::<BinaryBuilder>(0) { fb.append_value(item.address.as_slice()) }
+
+            let storage_keys_builder = list_builder
+                .values()
+                .field_builder::<arrow::array::builder::ListBuilder<BinaryBuilder>>(1);
+            if let Some(sk_builder) = storage_keys_builder {
+                for key in &item.storage_keys {
+                    sk_builder.values().append_value(key.as_slice());
+                }
+                sk_builder.append(true);
+            }
+            list_builder.values().append(true);
+        }
+        list_builder.append(true);
+    } else {
+        list_builder.append(false); // null list
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_logs_produce_valid_batch() {
+        let batch = logs_to_record_batch(&[]);
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.schema().as_ref(), &cherry_evm_schema::logs_schema());
+    }
+
+    #[test]
+    fn empty_blocks_produce_valid_batch() {
+        let batch = blocks_to_record_batch(&[]);
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &cherry_evm_schema::blocks_schema()
+        );
+    }
+
+    #[test]
+    fn empty_transactions_produce_valid_batch() {
+        let batch = transactions_to_record_batch(&[]);
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &cherry_evm_schema::transactions_schema()
+        );
+    }
+
+    #[test]
+    fn u256_to_i256_basic() {
+        let zero = u256_to_i256(U256::ZERO);
+        assert_eq!(zero, i256::ZERO);
+
+        let one = u256_to_i256(U256::from(1u64));
+        assert_eq!(one, i256::ONE);
+
+        let large = u256_to_i256(U256::from(1_000_000u64));
+        assert_eq!(large, i256::from_i128(1_000_000));
     }
 }

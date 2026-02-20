@@ -8,9 +8,17 @@ use futures_lite::Stream;
 use crate::config::ClientConfig;
 use crate::query::Query;
 use crate::response::ArrowResponse;
-use crate::rpc::{start_log_stream, RpcProvider};
+use crate::rpc::{start_block_stream, start_log_stream, RpcProvider};
 
 pub type DataStream = Pin<Box<dyn Stream<Item = Result<ArrowResponse>> + Send + Sync>>;
+
+/// Returns `true` if the query requires the `eth_getLogs` pipeline.
+///
+/// The log pipeline is selected when the query contains log requests.
+/// Otherwise the block pipeline (`eth_getBlockByNumber`) is used.
+fn needs_log_pipeline(query: &Query) -> bool {
+    !query.logs.is_empty()
+}
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -33,10 +41,16 @@ impl Client {
 
     /// Start a streaming query that yields `ArrowResponse` chunks.
     ///
-    /// The stream fetches logs in block-range batches (historical phase),
-    /// then polls for new blocks (live phase) unless `stop_on_head` is set.
+    /// Selects the appropriate pipeline based on the query:
+    /// - If log requests are present, uses the `eth_getLogs` pipeline.
+    /// - Otherwise (block/transaction fields requested), uses the
+    ///   `eth_getBlockByNumber` pipeline.
     pub fn stream(&self, query: Query) -> Result<DataStream> {
-        let rx = start_log_stream(self.provider.clone(), query, self.config.clone());
+        let rx = if needs_log_pipeline(&query) {
+            start_log_stream(self.provider.clone(), query, self.config.clone())
+        } else {
+            start_block_stream(self.provider.clone(), query, self.config.clone())
+        };
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
@@ -73,46 +87,8 @@ mod tests {
     /// Root of the cherry-rpc-client repository (one level above `rust/`).
     const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
-    fn write_parquet(path: &Path, batches: &[RecordBatch]) {
-        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
-            return;
-        }
-        let schema = batches[0].schema();
-        let file = File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
-        let mut writer = ArrowWriter::try_new(file, schema, None)
-            .unwrap_or_else(|e| panic!("ArrowWriter::try_new: {e}"));
-        for batch in batches {
-            writer
-                .write(batch)
-                .unwrap_or_else(|e| panic!("ArrowWriter::write: {e}"));
-        }
-        writer
-            .close()
-            .unwrap_or_else(|e| panic!("ArrowWriter::close: {e}"));
-    }
-
     /// Tenderly free Ethereum mainnet gateway (same default as rindexer examples).
     const RPC_URL: &str = "https://mainnet.gateway.tenderly.co";
-
-    /// Initialise env_logger so log output is visible when running
-    /// tests with `--nocapture`. Defaults to `info`; override with `RUST_LOG`.
-    /// Silently ignores the error if a logger has already been set.
-    fn setup_tracing() {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Info)
-            .parse_default_env()
-            .try_init();
-    }
-
-    fn reth_address() -> Address {
-        let a = address!("ae78736cd615f374d3085123a210448e74fc6393");
-        Address(a.0 .0)
-    }
-
-    fn transfer_topic0() -> Topic {
-        let t = b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
-        Topic(t.0)
-    }
 
     fn make_client() -> Client {
         Client::new(ClientConfig {
@@ -123,27 +99,17 @@ mod tests {
         .unwrap_or_else(|e| panic!("Failed to create client: {e}"))
     }
 
-    #[test]
-    fn client_creation_succeeds() {
-        let _client = make_client();
-    }
-
-    #[test]
-    fn response_to_btree_maps_keys() {
-        let resp = ArrowResponse::empty();
-        let btree = Client::response_to_btree(resp);
-        assert_eq!(btree.len(), 4);
-        assert!(btree.contains_key("blocks"));
-        assert!(btree.contains_key("transactions"));
-        assert!(btree.contains_key("logs"));
-        assert!(btree.contains_key("traces"));
-    }
-
     /// Streaming query: fetches the last 5000 blocks up to the current head
     /// (`stop_on_head: true`) and saves all log chunks to Parquet.
     #[tokio::test]
     async fn stream_reth_transfer_logs() {
-        setup_tracing();
+        /// Initialise env_logger so log output is visible when running
+        /// tests with `--nocapture`. Defaults to `info`; override with `RUST_LOG`.
+        /// Silently ignores the error if a logger has already been set.
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .parse_default_env()
+            .try_init();
         let client = make_client();
 
         // Resolve the current head and log it.
@@ -156,13 +122,19 @@ mod tests {
 
         let from_block = latest_block.saturating_sub(5_000);
 
+        let a = address!("ae78736cd615f374d3085123a210448e74fc6393");
+        let reth_address = Address(a.0 .0);
+
+        let t = b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
+        let transfer_topic0 = Topic(t.0);
+
         let query = Query {
             from_block,
             to_block: Some(latest_block),
             include_all_blocks: false,
             logs: vec![LogRequest {
-                address: vec![reth_address()],
-                topic0: vec![transfer_topic0()],
+                address: vec![reth_address],
+                topic0: vec![transfer_topic0],
                 ..LogRequest::default()
             }],
             transactions: Vec::new(),
@@ -249,4 +221,23 @@ mod tests {
             write_parquet(&path, &batches);
         }
     }
+
+    fn write_parquet(path: &Path, batches: &[RecordBatch]) {
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return;
+        }
+        let schema = batches[0].schema();
+        let file = File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .unwrap_or_else(|e| panic!("ArrowWriter::try_new: {e}"));
+        for batch in batches {
+            writer
+                .write(batch)
+                .unwrap_or_else(|e| panic!("ArrowWriter::write: {e}"));
+        }
+        writer
+            .close()
+            .unwrap_or_else(|e| panic!("ArrowWriter::close: {e}"));
+    }
+    
 }

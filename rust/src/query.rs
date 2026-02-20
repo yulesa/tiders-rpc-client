@@ -203,22 +203,17 @@ pub struct TraceFields {
 
 // Warnings for requested-but-unimplemented data pipelines.
 pub(crate) fn emit_unimplemented_warnings(query: &Query) {
-    let block_fields = requested_block_fields(query);
-    if !block_fields.is_empty() {
+    // Receipt-only transaction fields
+    let receipt_fields = requested_receipt_only_fields(query);
+    if !receipt_fields.is_empty() {
         warn!(
-            "Query includes [{}] part of eth_getBlockByNumber pipeline, \
-             which is not yet implemented. Block columns will be null.",
-            block_fields.join(", ")
+            "Query includes transaction fields [{}] which require \
+             eth_getTransactionReceipt (not yet implemented). \
+             These columns will be null.",
+            receipt_fields.join(", ")
         );
     }
-    let tx_fields = requested_tx_fields(query);
-    if !tx_fields.is_empty() {
-        warn!(
-            "Query includes [{}] part of eth_getBlockByNumber pipeline, \
-             which is not yet implemented. Transaction columns will be null.",
-            tx_fields.join(", ")
-        );
-    }
+
     let trace_fields = requested_trace_fields(query);
     if !trace_fields.is_empty() {
         warn!(
@@ -229,6 +224,33 @@ pub(crate) fn emit_unimplemented_warnings(query: &Query) {
     }
 }
 
+fn requested_receipt_only_fields(query: &Query) -> Vec<&'static str> {
+    let f = &query.fields.transaction;
+    let mut fields = Vec::new();
+    if f.cumulative_gas_used {
+        fields.push("cumulative_gas_used");
+    }
+    if f.effective_gas_price {
+        fields.push("effective_gas_price");
+    }
+    if f.gas_used {
+        fields.push("gas_used");
+    }
+    if f.contract_address {
+        fields.push("contract_address");
+    }
+    if f.logs_bloom {
+        fields.push("logs_bloom");
+    }
+    if f.root {
+        fields.push("root");
+    }
+    if f.status {
+        fields.push("status");
+    }
+    fields
+}
+
 /// Collect the names of all `true` bool fields from a struct.
 macro_rules! collect_set_fields {
     ($obj:expr, $( $field:ident ),+ $(,)?) => {{
@@ -236,74 +258,6 @@ macro_rules! collect_set_fields {
         $( if $obj.$field { fields.push(stringify!($field)); } )+
         fields
     }};
-}
-
-fn requested_block_fields(query: &Query) -> Vec<&'static str> {
-    collect_set_fields!(
-        query.fields.block,
-        number,
-        hash,
-        parent_hash,
-        nonce,
-        sha3_uncles,
-        logs_bloom,
-        transactions_root,
-        state_root,
-        receipts_root,
-        miner,
-        difficulty,
-        total_difficulty,
-        extra_data,
-        size,
-        gas_limit,
-        gas_used,
-        timestamp,
-        uncles,
-        base_fee_per_gas,
-        blob_gas_used,
-        excess_blob_gas,
-        parent_beacon_block_root,
-        withdrawals_root,
-        withdrawals,
-        l1_block_number,
-        send_count,
-        send_root,
-        mix_hash,
-    )
-}
-
-fn requested_tx_fields(query: &Query) -> Vec<&'static str> {
-    collect_set_fields!(
-        query.fields.transaction,
-        block_hash,
-        block_number,
-        from,
-        gas,
-        gas_price,
-        hash,
-        input,
-        nonce,
-        to,
-        transaction_index,
-        value,
-        v,
-        r,
-        s,
-        max_priority_fee_per_gas,
-        max_fee_per_gas,
-        chain_id,
-        cumulative_gas_used,
-        effective_gas_price,
-        gas_used,
-        contract_address,
-        logs_bloom,
-        type_,
-        root,
-        status,
-        sighash,
-        y_parity,
-        access_list,
-    )
 }
 
 fn requested_trace_fields(query: &Query) -> Vec<&'static str> {
