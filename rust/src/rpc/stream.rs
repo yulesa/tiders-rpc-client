@@ -15,7 +15,6 @@ use crate::convert::{
     blocks_to_record_batch, clamp_to_block, halved_block_range, logs_to_record_batch,
     retry_with_block_range, transactions_to_record_batch,
 };
-use crate::query::emit_unimplemented_warnings;
 use crate::query::{LogRequest, Query, TransactionRequest};
 use crate::response::ArrowResponse;
 
@@ -52,9 +51,6 @@ async fn run_stream(
     config: ClientConfig,
     tx: mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<()> {
-    // Warn about unimplemented pipelines.
-    emit_unimplemented_warnings(&query);
-
     let from_block = query.from_block;
 
     // Determine snapshot_latest_block: either user-specified or current head.
@@ -297,8 +293,6 @@ async fn run_block_stream(
     config: ClientConfig,
     tx: mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<()> {
-    emit_unimplemented_warnings(&query);
-
     let from_block = query.from_block;
 
     let snapshot_latest_block = match query.to_block {

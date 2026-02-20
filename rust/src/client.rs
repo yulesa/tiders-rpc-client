@@ -6,19 +6,11 @@ use arrow::record_batch::RecordBatch;
 use futures_lite::Stream;
 
 use crate::config::ClientConfig;
-use crate::query::Query;
+use crate::query::{analyze_query, Pipeline, Query};
 use crate::response::ArrowResponse;
 use crate::rpc::{start_block_stream, start_log_stream, RpcProvider};
 
 pub type DataStream = Pin<Box<dyn Stream<Item = Result<ArrowResponse>> + Send + Sync>>;
-
-/// Returns `true` if the query requires the `eth_getLogs` pipeline.
-///
-/// The log pipeline is selected when the query contains log requests.
-/// Otherwise the block pipeline (`eth_getBlockByNumber`) is used.
-fn needs_log_pipeline(query: &Query) -> bool {
-    !query.logs.is_empty()
-}
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -46,10 +38,15 @@ impl Client {
     /// - Otherwise (block/transaction fields requested), uses the
     ///   `eth_getBlockByNumber` pipeline.
     pub fn stream(&self, query: Query) -> Result<DataStream> {
-        let rx = if needs_log_pipeline(&query) {
-            start_log_stream(self.provider.clone(), query, self.config.clone())
-        } else {
-            start_block_stream(self.provider.clone(), query, self.config.clone())
+        let pipeline = analyze_query(&query)?;
+
+        let rx = match pipeline {
+            Pipeline::Log => {
+                start_log_stream(self.provider.clone(), query, self.config.clone())
+            }
+            Pipeline::Block => {
+                start_block_stream(self.provider.clone(), query, self.config.clone())
+            }
         };
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
@@ -103,9 +100,9 @@ mod tests {
     /// (`stop_on_head: true`) and saves all log chunks to Parquet.
     #[tokio::test]
     async fn stream_reth_transfer_logs() {
-        /// Initialise env_logger so log output is visible when running
-        /// tests with `--nocapture`. Defaults to `info`; override with `RUST_LOG`.
-        /// Silently ignores the error if a logger has already been set.
+        // Initialise env_logger so log output is visible when running
+        // tests with `--nocapture`. Defaults to `info`; override with `RUST_LOG`.
+        // Silently ignores the error if a logger has already been set.
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Info)
             .parse_default_env()
@@ -155,15 +152,12 @@ mod tests {
                     topic3: true,
                 },
                 block: BlockFields {
-                    number: true,
                     ..BlockFields::default()
                 },
                 transaction: TransactionFields {
-                    hash: true,
                     ..TransactionFields::default()
                 },
                 trace: TraceFields {
-                    from: true,
                     ..TraceFields::default()
                 },
             },
@@ -218,6 +212,127 @@ mod tests {
         ] {
             let batches: Vec<RecordBatch> = all_responses.iter().map(extract).collect();
             let path = root.join(format!("data/stream_{name}.parquet"));
+            write_parquet(&path, &batches);
+        }
+    }
+
+    /// Streaming query: fetches the last 100 blocks up to the current head
+    /// via the block fetcher pipeline (`eth_getBlockByNumber`) and saves
+    /// blocks and transactions to Parquet.
+    #[tokio::test]
+    async fn stream_blocks_and_transactions() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .parse_default_env()
+            .try_init();
+        let client = make_client();
+
+        let latest_block = client
+            .provider
+            .get_block_number()
+            .await
+            .unwrap_or_else(|e| panic!("failed to get block number: {e}"));
+        log::info!("Latest block: {latest_block}");
+
+        let from_block = latest_block.saturating_sub(10);
+
+        let query = Query {
+            from_block,
+            to_block: Some(latest_block),
+            include_all_blocks: true,
+            logs: Vec::new(),
+            transactions: Vec::new(),
+            traces: Vec::new(),
+            fields: Fields {
+                block: BlockFields {
+                    number: true,
+                    hash: true,
+                    timestamp: true,
+                    gas_used: true,
+                    gas_limit: true,
+                    base_fee_per_gas: true,
+                    miner: true,
+                    ..BlockFields::default()
+                },
+                transaction: TransactionFields {
+                    block_number: true,
+                    hash: true,
+                    from: true,
+                    to: true,
+                    value: true,
+                    gas: true,
+                    gas_price: true,
+                    transaction_index: true,
+                    ..TransactionFields::default()
+                },
+                log: LogFields {
+                    ..LogFields::default()
+                },
+                trace: TraceFields {
+                    ..TraceFields::default()
+                },
+            },
+        };
+
+        let mut stream = client
+            .stream(query)
+            .unwrap_or_else(|e| panic!("stream creation failed: {e}"));
+
+        let mut total_block_rows = 0u64;
+        let mut total_tx_rows = 0u64;
+        let mut chunk_count = 0u64;
+        let mut all_responses: Vec<ArrowResponse> = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            let resp = result.unwrap_or_else(|e| panic!("stream chunk failed: {e}"));
+
+            // Every chunk should carry the correct schemas.
+            assert_eq!(
+                resp.blocks.schema().as_ref(),
+                &cherry_evm_schema::blocks_schema(),
+            );
+            assert_eq!(
+                resp.transactions.schema().as_ref(),
+                &cherry_evm_schema::transactions_schema(),
+            );
+
+            // Log and trace tables should be empty for the block pipeline.
+            assert_eq!(resp.logs.num_rows(), 0);
+            assert_eq!(resp.traces.num_rows(), 0);
+
+            total_block_rows += resp.blocks.num_rows() as u64;
+            total_tx_rows += resp.transactions.num_rows() as u64;
+            chunk_count += 1;
+            all_responses.push(resp);
+        }
+
+        assert!(
+            total_block_rows > 0,
+            "stream should have yielded block rows"
+        );
+        assert!(
+            chunk_count > 0,
+            "stream should have yielded at least one chunk"
+        );
+
+        log::info!(
+            "Streamed {total_block_rows} block rows and {total_tx_rows} tx rows \
+             in {chunk_count} chunks"
+        );
+
+        // Save all streamed chunks to parquet files.
+        let root = Path::new(REPO_ROOT);
+        for (name, extract) in [
+            (
+                "blocks",
+                (|r: &ArrowResponse| r.blocks.clone()) as fn(&ArrowResponse) -> RecordBatch,
+            ),
+            ("transactions", |r| r.transactions.clone()),
+            ("logs", |r| r.logs.clone()),
+            ("traces", |r| r.traces.clone()),
+        ] {
+            let batches: Vec<RecordBatch> = all_responses.iter().map(extract).collect();
+            let path = root.join(format!("data/block_stream_{name}.parquet"));
             write_parquet(&path, &batches);
         }
     }

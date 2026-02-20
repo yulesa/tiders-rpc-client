@@ -21,7 +21,7 @@ use alloy::{
     },
 };
 use anyhow::{Context, Result};
-use log::error;
+use log::{error, info};
 use tokio::sync::Semaphore;
 use url::Url;
 
@@ -140,6 +140,13 @@ impl RpcProvider {
                         .acquire_owned()
                         .await
                         .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
+
+                    info!(
+                        "get_blocks_by_number: sending sub-batch of {} blocks ({}-{})",
+                        owned_chunk.len(),
+                        owned_chunk.first().copied().unwrap_or(0),
+                        owned_chunk.last().copied().unwrap_or(0),
+                    );
 
                     let mut batch = client.new_batch();
                     let mut request_futures = Vec::with_capacity(owned_chunk.len());

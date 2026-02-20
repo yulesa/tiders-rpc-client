@@ -10,7 +10,7 @@ use alloy::eips::Typed2718;
 use alloy::network::primitives::BlockTransactions;
 use alloy::network::{AnyRpcBlock, AnyRpcTransaction, TransactionResponse};
 use anyhow::{Context, Result};
-use log::debug;
+use log::info;
 
 use crate::query::TransactionRequest;
 
@@ -30,15 +30,18 @@ pub async fn fetch_blocks(
     }
 
     let block_numbers: Vec<u64> = (from_block..=to_block).collect();
-    debug!(
-        "Fetching {} blocks ({from_block}..{to_block}) with full transactions",
-        block_numbers.len()
-    );
+    let count = block_numbers.len();
+    info!("fetch_blocks: requesting {count} blocks ({from_block}..={to_block})");
 
     let blocks = provider
         .get_blocks_by_number(&block_numbers, true)
         .await
         .context("eth_getBlockByNumber batch failed")?;
+
+    info!(
+        "fetch_blocks: received {} blocks for range {from_block}..={to_block}",
+        blocks.len()
+    );
 
     Ok(blocks)
 }

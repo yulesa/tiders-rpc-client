@@ -3,7 +3,7 @@
 //! These mirror `cherry_ingest::evm::Query` but are owned by this crate
 //! so the RPC client can evolve independently.
 
-use log::warn;
+use anyhow::{bail, Result};
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Address(pub [u8; 20]);
@@ -201,54 +201,11 @@ pub struct TraceFields {
     pub refund_address: bool,
 }
 
-// Warnings for requested-but-unimplemented data pipelines.
-pub(crate) fn emit_unimplemented_warnings(query: &Query) {
-    // Receipt-only transaction fields
-    let receipt_fields = requested_receipt_only_fields(query);
-    if !receipt_fields.is_empty() {
-        warn!(
-            "Query includes transaction fields [{}] which require \
-             eth_getTransactionReceipt (not yet implemented). \
-             These columns will be null.",
-            receipt_fields.join(", ")
-        );
-    }
-
-    let trace_fields = requested_trace_fields(query);
-    if !trace_fields.is_empty() {
-        warn!(
-            "Query includes [{}] part of trace pipeline, \
-             which is not yet implemented. Trace columns will be null.",
-            trace_fields.join(", ")
-        );
-    }
-}
-
-fn requested_receipt_only_fields(query: &Query) -> Vec<&'static str> {
-    let f = &query.fields.transaction;
-    let mut fields = Vec::new();
-    if f.cumulative_gas_used {
-        fields.push("cumulative_gas_used");
-    }
-    if f.effective_gas_price {
-        fields.push("effective_gas_price");
-    }
-    if f.gas_used {
-        fields.push("gas_used");
-    }
-    if f.contract_address {
-        fields.push("contract_address");
-    }
-    if f.logs_bloom {
-        fields.push("logs_bloom");
-    }
-    if f.root {
-        fields.push("root");
-    }
-    if f.status {
-        fields.push("status");
-    }
-    fields
+/// Return `true` if any of the listed bool fields is set.
+macro_rules! any_field_set {
+    ($obj:expr, $( $field:ident ),+ $(,)?) => {
+        $( $obj.$field )||+
+    };
 }
 
 /// Collect the names of all `true` bool fields from a struct.
@@ -260,33 +217,169 @@ macro_rules! collect_set_fields {
     }};
 }
 
-fn requested_trace_fields(query: &Query) -> Vec<&'static str> {
-    collect_set_fields!(
-        query.fields.trace,
-        from,
-        to,
-        call_type,
-        gas,
-        input,
-        init,
-        value,
-        author,
-        reward_type,
-        block_hash,
-        block_number,
-        address,
-        code,
-        gas_used,
-        output,
-        subtraces,
-        trace_address,
-        transaction_hash,
-        transaction_position,
-        type_,
-        error,
-        sighash,
-        action_address,
-        balance,
-        refund_address,
+/// The RPC pipeline a validated query should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pipeline {
+    /// `eth_getBlockByNumber` — fetches blocks and transactions.
+    Block,
+    /// `eth_getLogs` — fetches event logs.
+    Log,
+}
+
+/// Validate a query and determine which RPC pipeline it requires.
+///
+/// Returns an error if the query:
+/// - Selects fields that belong to different RPC pipelines (e.g. log fields
+///   together with block/transaction fields).
+/// - Includes filters for unimplemented pipelines (transaction or trace filters).
+/// - Requests fields from unimplemented methods (`eth_getTransactionReceipt`,
+///   `trace_block` / `debug_traceBlockByNumber`).
+pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
+    let has_log_fields = has_any_log_field(&query.fields.log);
+    let has_block_fields = has_any_block_field(&query.fields.block);
+    let has_tx_fields = has_any_transaction_field(&query.fields.transaction);
+    let has_trace_fields = has_any_trace_field(&query.fields.trace);
+
+    let uses_log_pipeline = !query.logs.is_empty() || has_log_fields;
+    let uses_block_pipeline = has_block_fields || has_tx_fields || !query.transactions.is_empty();
+    let uses_trace_pipeline = has_trace_fields || !query.traces.is_empty();
+
+    // 1. Cross-pipeline field selection
+    let pipeline_count =
+        uses_log_pipeline as u8 + uses_block_pipeline as u8 + uses_trace_pipeline as u8;
+    if pipeline_count > 1 {
+        let mut pipelines = Vec::new();
+        if uses_log_pipeline {
+            pipelines.push("eth_getLogs (log fields/filters)");
+        }
+        if uses_block_pipeline {
+            pipelines.push("eth_getBlockByNumber (block/transaction fields/filters)");
+        }
+        if uses_trace_pipeline {
+            pipelines.push("trace_block (trace fields/filters)");
+        }
+        bail!(
+            "Query mixes fields/filters from different RPC pipelines: [{}]. \
+             RPC providers only support a queries that target one pipeline. Split your indexer into separate pipeline and do filter/join post indexing.",
+            pipelines.join(", ")
+        );
+    }
+
+    // 2. Filters for unimplemented pipelines
+    if !query.transactions.is_empty() {
+        for (i, req) in query.transactions.iter().enumerate() {
+            if !req.status.is_empty() || !req.contract_deployment_address.is_empty() {
+                let mut unsupported = Vec::new();
+                if !req.status.is_empty() {
+                    unsupported.push("status");
+                }
+                if !req.contract_deployment_address.is_empty() {
+                    unsupported.push("contract_deployment_address");
+                }
+                bail!(
+                    "Transaction filter [{}] in transactions[{i}] requires \
+                     eth_getTransactionReceipt which is not yet implemented.",
+                    unsupported.join(", ")
+                );
+            }
+        }
+    }
+
+    if !query.traces.is_empty() {
+        bail!(
+            "Query includes trace filters but the trace pipeline \
+             (trace_block / debug_traceBlockByNumber) is not yet implemented."
+        );
+    }
+
+    // 3. Unimplemented field selections
+    if has_any_tx_receipt_field(&query.fields.transaction) {
+        let names = collect_tx_receipt_fields(&query.fields.transaction);
+        bail!(
+            "Query selects transaction fields [{}] which require \
+             eth_getTransactionReceipt (not yet implemented).",
+            names.join(", ")
+        );
+    }
+
+    if has_any_trace_field(&query.fields.trace) {
+        let names = collect_trace_fields(&query.fields.trace);
+        bail!(
+            "Query selects trace fields [{}] which require the trace pipeline \
+             (trace_block / debug_traceBlockByNumber, not yet implemented).",
+            names.join(", ")
+        );
+    }
+
+    // 4. Determine pipeline
+    if uses_log_pipeline {
+        Ok(Pipeline::Log)
+    } else {
+        Ok(Pipeline::Block)
+    }
+}
+
+fn has_any_log_field(f: &LogFields) -> bool {
+    any_field_set!(
+        f, removed, log_index, transaction_index, transaction_hash, block_hash, block_number,
+        address, data, topic0, topic1, topic2, topic3,
     )
+}
+
+fn has_any_block_field(f: &BlockFields) -> bool {
+    any_field_set!(
+        f, number, hash, parent_hash, nonce, sha3_uncles, logs_bloom, transactions_root,
+        state_root, receipts_root, miner, difficulty, total_difficulty, extra_data, size,
+        gas_limit, gas_used, timestamp, uncles, base_fee_per_gas, blob_gas_used,
+        excess_blob_gas, parent_beacon_block_root, withdrawals_root, withdrawals,
+        l1_block_number, send_count, send_root, mix_hash,
+    )
+}
+
+fn has_any_transaction_field(f: &TransactionFields) -> bool {
+    any_field_set!(
+        f, block_hash, block_number, from, gas, gas_price, hash, input, nonce, to,
+        transaction_index, value, v, r, s, max_priority_fee_per_gas, max_fee_per_gas, chain_id,
+        cumulative_gas_used, effective_gas_price, gas_used, contract_address, logs_bloom, type_,
+        root, status, sighash, y_parity, access_list, l1_fee, l1_gas_price, l1_fee_scalar,
+        gas_used_for_l1, max_fee_per_blob_gas, blob_versioned_hashes, deposit_nonce,
+        blob_gas_price, deposit_receipt_version, blob_gas_used, l1_base_fee_scalar,
+        l1_blob_base_fee, l1_blob_base_fee_scalar, l1_block_number, mint, source_hash,
+    )
+}
+
+fn has_any_tx_receipt_field(f: &TransactionFields) -> bool {
+    any_field_set!(
+        f, cumulative_gas_used, effective_gas_price, gas_used,
+        contract_address, logs_bloom, root, status,
+    )
+}
+
+fn has_any_trace_field(f: &TraceFields) -> bool {
+    any_field_set!(
+        f, from, to, call_type, gas, input, init, value, author, reward_type,
+        block_hash, block_number, address, code, gas_used, output, subtraces,
+        trace_address, transaction_hash, transaction_position, type_, error,
+        sighash, action_address, balance, refund_address,
+    )
+}
+
+fn collect_trace_fields(f: &TraceFields) -> Vec<&'static str> {
+    let fields = collect_set_fields!(
+        f,
+        from, to, call_type, gas, input, init, value, author, reward_type,
+        block_hash, block_number, address, code, gas_used, output, subtraces,
+        trace_address, transaction_hash, transaction_position, type_, error,
+        sighash, action_address, balance, refund_address,
+    );
+    fields
+}
+
+fn collect_tx_receipt_fields(f: &TransactionFields) -> Vec<&'static str> {
+    let fields = collect_set_fields!(
+        f,
+        cumulative_gas_used, effective_gas_price, gas_used,
+        contract_address, logs_bloom, root, status,
+    );
+    fields
 }
