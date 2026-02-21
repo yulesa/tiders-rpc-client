@@ -78,7 +78,7 @@ mod tests {
     use crate::config::ClientConfig;
     use crate::query::{
         Address, BlockFields, Fields, LogFields, LogRequest, Query, Topic, TraceFields,
-        TransactionFields,
+        TransactionFields, TransactionRequest,
     };
 
     /// Root of the cherry-rpc-client repository (one level above `rust/`).
@@ -241,7 +241,9 @@ mod tests {
             to_block: Some(latest_block),
             include_all_blocks: true,
             logs: Vec::new(),
-            transactions: Vec::new(),
+            transactions: vec![TransactionRequest {
+                ..TransactionRequest::default()
+            }],
             traces: Vec::new(),
             fields: Fields {
                 block: BlockFields {
@@ -255,14 +257,14 @@ mod tests {
                     ..BlockFields::default()
                 },
                 transaction: TransactionFields {
-                    block_number: true,
+                    // block_number: true,
                     hash: true,
-                    from: true,
-                    to: true,
-                    value: true,
-                    gas: true,
-                    gas_price: true,
-                    transaction_index: true,
+                    // from: true,
+                    // to: true,
+                    // value: true,
+                    // gas: true,
+                    // gas_price: true,
+                    // transaction_index: true,
                     ..TransactionFields::default()
                 },
                 log: LogFields {
@@ -286,15 +288,21 @@ mod tests {
         while let Some(result) = stream.next().await {
             let resp = result.unwrap_or_else(|e| panic!("stream chunk failed: {e}"));
 
-            // Every chunk should carry the correct schemas.
-            assert_eq!(
-                resp.blocks.schema().as_ref(),
-                &cherry_evm_schema::blocks_schema(),
-            );
-            assert_eq!(
-                resp.transactions.schema().as_ref(),
-                &cherry_evm_schema::transactions_schema(),
-            );
+            // Blocks batch should contain exactly the requested fields.
+            let block_schema = resp.blocks.schema();
+            assert!(block_schema.field_with_name("number").is_ok());
+            assert!(block_schema.field_with_name("hash").is_ok());
+            assert!(block_schema.field_with_name("timestamp").is_ok());
+            assert!(block_schema.field_with_name("gas_used").is_ok());
+            assert!(block_schema.field_with_name("gas_limit").is_ok());
+            assert!(block_schema.field_with_name("base_fee_per_gas").is_ok());
+            assert!(block_schema.field_with_name("miner").is_ok());
+            assert_eq!(block_schema.fields().len(), 7);
+
+            // Transactions batch should contain exactly the requested fields.
+            let tx_schema = resp.transactions.schema();
+            assert!(tx_schema.field_with_name("hash").is_ok());
+            assert_eq!(tx_schema.fields().len(), 1);
 
             // Log and trace tables should be empty for the block pipeline.
             assert_eq!(resp.logs.num_rows(), 0);

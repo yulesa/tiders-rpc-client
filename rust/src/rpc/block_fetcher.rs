@@ -16,7 +16,7 @@ use crate::query::TransactionRequest;
 
 use super::provider::RpcProvider;
 
-/// Fetch blocks (with full transaction objects) for a range of block numbers.
+/// Fetch blocks for a range of block numbers.
 ///
 /// This creates a contiguous range `[from_block, to_block]` and fetches them
 /// via JSON-RPC batch calls.
@@ -24,6 +24,7 @@ pub async fn fetch_blocks(
     provider: &RpcProvider,
     from_block: u64,
     to_block: u64,
+    include_txs: bool,
 ) -> Result<Vec<AnyRpcBlock>> {
     if from_block > to_block {
         return Ok(Vec::new());
@@ -34,7 +35,7 @@ pub async fn fetch_blocks(
     info!("fetch_blocks: requesting {count} blocks ({from_block}..={to_block})");
 
     let blocks = provider
-        .get_blocks_by_number(&block_numbers, true)
+        .get_blocks_by_number(&block_numbers, include_txs)
         .await
         .context("eth_getBlockByNumber batch failed")?;
 

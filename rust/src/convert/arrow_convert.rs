@@ -4,12 +4,14 @@ use alloy::consensus::Transaction as TransactionTrait;
 use alloy::eips::Typed2718;
 use alloy::network::primitives::BlockTransactions;
 use alloy::network::{AnyRpcBlock, TransactionResponse};
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{B256, U128, U256};
 use alloy::rpc::types::Log;
 use arrow::array::builder::{BinaryBuilder, Decimal256Builder};
 use arrow::datatypes::i256;
 use arrow::record_batch::RecordBatch;
 use cherry_evm_schema::{BlocksBuilder, LogsBuilder, TransactionsBuilder};
+
+use crate::query::{BlockFields, LogFields, TransactionFields};
 
 /// Convert a `U256` (unsigned 256-bit) to Arrow's `i256` (signed 256-bit).
 ///
@@ -66,7 +68,7 @@ fn append_optional_u64_decimal(builder: &mut Decimal256Builder, val: Option<u64>
 }
 
 // ---------------------------------------------------------------------------
-// Logs
+// Functions for Logs conversion to RecordBatch
 // ---------------------------------------------------------------------------
 
 /// Convert a slice of alloy `Log`s into a `RecordBatch` matching `logs_schema()`.
@@ -141,7 +143,7 @@ fn append_topic(
 }
 
 // ---------------------------------------------------------------------------
-// Blocks
+// Functions for Blocks conversion to RecordBatch
 // ---------------------------------------------------------------------------
 
 /// Convert a slice of `AnyRpcBlock` into a `RecordBatch` matching `blocks_schema()`.
@@ -288,7 +290,7 @@ fn append_withdrawals(
 }
 
 // ---------------------------------------------------------------------------
-// Transactions
+// Function for Transactions conversion to RecordBatch
 // ---------------------------------------------------------------------------
 
 /// Convert blocks (with full transaction objects) into a `RecordBatch`
@@ -305,146 +307,182 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
         let block_hash = block.inner.header.hash;
         let block_number = block.inner.header.inner.number;
 
-        let BlockTransactions::Full(txns) = &block.inner.transactions else {
-            continue;
-        };
-
-        for tx in txns {
-            // block_hash
-            t.block_hash.append_value(block_hash.as_slice());
-
-            // block_number
-            t.block_number.append_value(block_number);
-
-            // from (sender)
-            t.from
-                .append_value(TransactionResponse::from(tx).as_slice());
-
-            // gas (gas_limit: u64 → Decimal256)
-            t.gas.append_value(u64_to_i256(tx.gas_limit()));
-
-            // gas_price (Option<u128>) — use the Transaction trait version
-            append_optional_u128(
-                &mut t.gas_price,
-                TransactionTrait::gas_price(tx),
-            );
-
-            // hash
-            t.hash.append_value(tx.tx_hash().as_slice());
-
-            // input
-            t.input.append_value(tx.input().as_ref());
-
-            // nonce (u64 → Decimal256)
-            t.nonce.append_value(u64_to_i256(tx.nonce()));
-
-            // to (TxKind: Create → null, Call(addr) → addr)
-            match TransactionTrait::to(tx) {
-                Some(addr) => t.to.append_value(addr.as_slice()),
-                None => t.to.append_null(),
-            }
-
-            // transaction_index
-            if let Some(idx) = tx.transaction_index() {
-                t.transaction_index.append_value(idx);
-            } else {
-                t.transaction_index.append_null();
-            }
-
-            // value (U256 → Decimal256)
-            t.value.append_value(u256_to_i256(tx.value()));
-
-            // Signature fields
-            append_signature_fields(&mut t, tx);
-
-            // max_priority_fee_per_gas (Option<u128>)
-            append_optional_u128(
-                &mut t.max_priority_fee_per_gas,
-                tx.max_priority_fee_per_gas(),
-            );
-
-            // max_fee_per_gas — only present on EIP-1559+ txs.
-            // The consensus trait returns u128 unconditionally; for legacy txs
-            // gas_price is Some while max_priority_fee_per_gas is None.
-            let gas_price = TransactionTrait::gas_price(tx);
-            if gas_price.is_none() {
-                // EIP-1559+ transaction (no legacy gas_price)
-                t.max_fee_per_gas
-                    .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
-            } else if tx.max_priority_fee_per_gas().is_some() {
-                // Has both gas_price and max_priority — EIP-1559 where
-                // gas_price is filled as effective_gas_price by the RPC.
-                t.max_fee_per_gas
-                    .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
-            } else {
-                t.max_fee_per_gas.append_null();
-            }
-
-            // chain_id (Option<u64> → Decimal256)
-            append_optional_u64_decimal(&mut t.chain_id, tx.chain_id());
-
-            // Receipt-only fields — null until receipt pipeline is implemented
-            t.cumulative_gas_used.append_null();
-            t.effective_gas_price.append_null();
-            t.gas_used.append_null();
-            t.contract_address.append_null();
-            t.logs_bloom.append_null();
-            t.root.append_null();
-            t.status.append_null();
-
-            // type (tx type byte)
-            t.type_.append_value(Typed2718::ty(tx));
-
-            // sighash (first 4 bytes of input, or null if input < 4 bytes)
-            let input = tx.input();
-            if input.len() >= 4 {
-                t.sighash.append_value(&input[..4]);
-            } else {
-                t.sighash.append_null();
-            }
-
-            // y_parity
-            append_y_parity(&mut t, tx);
-
-            // access_list
-            append_access_list(&mut t.access_list, tx);
-
-            // L1/Optimism fields — null
-            t.l1_fee.append_null();
-            t.l1_gas_price.append_null();
-            t.l1_gas_used.append_null();
-            t.l1_fee_scalar.append_null();
-            t.gas_used_for_l1.append_null();
-
-            // max_fee_per_blob_gas (Option<u128>)
-            append_optional_u128(
-                &mut t.max_fee_per_blob_gas,
-                tx.max_fee_per_blob_gas(),
-            );
-
-            // blob_versioned_hashes
-            if let Some(hashes) = tx.blob_versioned_hashes() {
-                for h in hashes {
-                    t.blob_versioned_hashes
-                        .values()
-                        .append_value(h.as_slice());
+        match &block.inner.transactions {
+            // include_txs=false: only tx hashes are available; emit one row per
+            // hash with all other fields null.
+            BlockTransactions::Hashes(hashes) => {
+                for hash in hashes {
+                    t.block_hash.append_value(block_hash.as_slice());
+                    t.block_number.append_value(block_number);
+                    t.from.append_null();
+                    t.gas.append_null();
+                    t.gas_price.append_null();
+                    t.hash.append_value(hash.as_slice());
+                    t.input.append_null();
+                    t.nonce.append_null();
+                    t.to.append_null();
+                    t.transaction_index.append_null();
+                    t.value.append_null();
+                    t.v.append_null();
+                    t.r.append_null();
+                    t.s.append_null();
+                    t.max_priority_fee_per_gas.append_null();
+                    t.max_fee_per_gas.append_null();
+                    t.chain_id.append_null();
+                    t.cumulative_gas_used.append_null();
+                    t.effective_gas_price.append_null();
+                    t.gas_used.append_null();
+                    t.contract_address.append_null();
+                    t.logs_bloom.append_null();
+                    t.type_.append_null();
+                    t.root.append_null();
+                    t.status.append_null();
+                    t.sighash.append_null();
+                    t.y_parity.append_null();
+                    t.access_list.0.append(false);
+                    t.l1_fee.append_null();
+                    t.l1_gas_price.append_null();
+                    t.l1_gas_used.append_null();
+                    t.l1_fee_scalar.append_null();
+                    t.gas_used_for_l1.append_null();
+                    t.max_fee_per_blob_gas.append_null();
+                    t.blob_versioned_hashes.append(false);
+                    t.deposit_nonce.append_null();
+                    t.blob_gas_price.append_null();
+                    t.deposit_receipt_version.append_null();
+                    t.blob_gas_used.append_null();
+                    t.l1_base_fee_scalar.append_null();
+                    t.l1_blob_base_fee.append_null();
+                    t.l1_blob_base_fee_scalar.append_null();
+                    t.l1_block_number.append_null();
+                    t.mint.append_null();
+                    t.source_hash.append_null();
                 }
-                t.blob_versioned_hashes.append(true);
-            } else {
-                t.blob_versioned_hashes.append(false);
             }
+            BlockTransactions::Uncle => {}
+            BlockTransactions::Full(txns) => {
+                for tx in txns {
+                    // block_hash
+                    t.block_hash.append_value(block_hash.as_slice());
 
-            // More L2/OP fields — null
-            t.deposit_nonce.append_null();
-            t.blob_gas_price.append_null();
-            t.deposit_receipt_version.append_null();
-            t.blob_gas_used.append_null();
-            t.l1_base_fee_scalar.append_null();
-            t.l1_blob_base_fee.append_null();
-            t.l1_blob_base_fee_scalar.append_null();
-            t.l1_block_number.append_null();
-            t.mint.append_null();
-            t.source_hash.append_null();
+                    // block_number
+                    t.block_number.append_value(block_number);
+
+                    // from (sender)
+                    t.from
+                        .append_value(TransactionResponse::from(tx).as_slice());
+
+                    // gas (gas_limit: u64 → Decimal256)
+                    t.gas.append_value(u64_to_i256(tx.gas_limit()));
+
+                    // gas_price (Option<u128>) — use the Transaction trait version
+                    append_optional_u128(
+                        &mut t.gas_price,
+                        TransactionTrait::gas_price(tx),
+                    );
+
+                    // hash
+                    t.hash.append_value(tx.tx_hash().as_slice());
+
+                    // input
+                    t.input.append_value(tx.input().as_ref());
+
+                    // nonce (u64 → Decimal256)
+                    t.nonce.append_value(u64_to_i256(tx.nonce()));
+
+                    // to (TxKind: Create → null, Call(addr) → addr)
+                    match TransactionTrait::to(tx) {
+                        Some(addr) => t.to.append_value(addr.as_slice()),
+                        None => t.to.append_null(),
+                    }
+
+                    // transaction_index
+                    if let Some(idx) = tx.transaction_index() {
+                        t.transaction_index.append_value(idx);
+                    } else {
+                        t.transaction_index.append_null();
+                    }
+
+                    // value (U256 → Decimal256)
+                    t.value.append_value(u256_to_i256(tx.value()));
+
+                    // Signature fields
+                    append_signature_fields(&mut t, tx);
+
+                    // max_priority_fee_per_gas (Option<u128>)
+                    append_optional_u128(
+                        &mut t.max_priority_fee_per_gas,
+                        tx.max_priority_fee_per_gas(),
+                    );
+
+                    // max_fee_per_gas — only present on EIP-1559+ txs.
+                    // The consensus trait returns u128 unconditionally; for legacy txs
+                    // gas_price is Some while max_priority_fee_per_gas is None.
+                    let gas_price = TransactionTrait::gas_price(tx);
+                    if gas_price.is_none() {
+                        // EIP-1559+ transaction (no legacy gas_price)
+                        t.max_fee_per_gas
+                            .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
+                    } else if tx.max_priority_fee_per_gas().is_some() {
+                        // Has both gas_price and max_priority — EIP-1559 where
+                        // gas_price is filled as effective_gas_price by the RPC.
+                        t.max_fee_per_gas
+                            .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
+                    } else {
+                        t.max_fee_per_gas.append_null();
+                    }
+
+                    // chain_id (Option<u64> → Decimal256)
+                    append_optional_u64_decimal(&mut t.chain_id, tx.chain_id());
+
+                    // Receipt-only fields — null until receipt pipeline is implemented
+                    t.cumulative_gas_used.append_null();
+                    t.effective_gas_price.append_null();
+                    t.gas_used.append_null();
+                    t.contract_address.append_null();
+                    t.logs_bloom.append_null();
+                    t.root.append_null();
+                    t.status.append_null();
+
+                    // type (tx type byte)
+                    t.type_.append_value(Typed2718::ty(tx));
+
+                    // sighash (first 4 bytes of input, or null if input < 4 bytes)
+                    let input = tx.input();
+                    if input.len() >= 4 {
+                        t.sighash.append_value(&input[..4]);
+                    } else {
+                        t.sighash.append_null();
+                    }
+
+                    // y_parity
+                    append_y_parity(&mut t, tx);
+
+                    // access_list
+                    append_access_list(&mut t.access_list, tx);
+
+                    // max_fee_per_blob_gas (Option<u128>)
+                    append_optional_u128(
+                        &mut t.max_fee_per_blob_gas,
+                        tx.max_fee_per_blob_gas(),
+                    );
+
+                    // blob_versioned_hashes
+                    if let Some(hashes) = tx.blob_versioned_hashes() {
+                        for h in hashes {
+                            t.blob_versioned_hashes
+                                .values()
+                                .append_value(h.as_slice());
+                        }
+                        t.blob_versioned_hashes.append(true);
+                    } else {
+                        t.blob_versioned_hashes.append(false);
+                    }
+
+                    // L1/OP fields — decoded from WithOtherFields if present
+                    append_op_fields(&mut t, tx);
+                }
+            }
         }
     }
 
@@ -524,6 +562,251 @@ fn append_access_list(
     } else {
         list_builder.append(false); // null list
     }
+}
+
+/// Append L1/OP-chain fields from the transaction's `other` fields map.
+///
+/// These fields are not part of the standard Ethereum JSON-RPC transaction
+/// object. On OP-stack chains they are returned as extra keys alongside the
+/// standard fields and land in `WithOtherFields::other` after alloy
+/// deserialisation. Each field is appended as null when absent (e.g. on
+/// mainnet) or when the value cannot be parsed.
+fn append_op_fields(
+    t: &mut TransactionsBuilder,
+    tx: &alloy::network::AnyRpcTransaction,
+) {
+    /// Read an optional hex-encoded U128 from `other` and convert to i256.
+    fn get_u128(other: &alloy::serde::OtherFields, key: &str) -> Option<i256> {
+        let v: U128 = other.get_deserialized::<U128>(key)?.ok()?;
+        Some(u128_to_i256(v.to()))
+    }
+
+    /// Read an optional hex-encoded U256 from `other` and convert to i256.
+    fn get_u256(other: &alloy::serde::OtherFields, key: &str) -> Option<i256> {
+        let v: U256 = other.get_deserialized::<U256>(key)?.ok()?;
+        Some(u256_to_i256(v))
+    }
+
+    /// Read an optional hex-encoded u64 from `other`.
+    fn get_u64(other: &alloy::serde::OtherFields, key: &str) -> Option<u64> {
+        let v: U256 = other.get_deserialized::<U256>(key)?.ok()?;
+        v.try_into().ok()
+    }
+
+    /// Read an optional hex-encoded B256 from `other`.
+    fn get_b256(other: &alloy::serde::OtherFields, key: &str) -> Option<B256> {
+        other.get_deserialized::<B256>(key)?.ok()
+    }
+
+    let o = &tx.other;
+
+    match get_u128(o, "l1Fee") {
+        Some(v) => t.l1_fee.append_value(v),
+        None => t.l1_fee.append_null(),
+    }
+    match get_u128(o, "l1GasPrice") {
+        Some(v) => t.l1_gas_price.append_value(v),
+        None => t.l1_gas_price.append_null(),
+    }
+    match get_u256(o, "l1GasUsed") {
+        Some(v) => t.l1_gas_used.append_value(v),
+        None => t.l1_gas_used.append_null(),
+    }
+    match get_u128(o, "l1FeeScalar") {
+        Some(v) => t.l1_fee_scalar.append_value(v),
+        None => t.l1_fee_scalar.append_null(),
+    }
+    match get_u256(o, "gasUsedForL1") {
+        Some(v) => t.gas_used_for_l1.append_value(v),
+        None => t.gas_used_for_l1.append_null(),
+    }
+    match get_u256(o, "depositNonce") {
+        Some(v) => t.deposit_nonce.append_value(v),
+        None => t.deposit_nonce.append_null(),
+    }
+    match get_u128(o, "blobGasPrice") {
+        Some(v) => t.blob_gas_price.append_value(v),
+        None => t.blob_gas_price.append_null(),
+    }
+    match get_u256(o, "depositReceiptVersion") {
+        Some(v) => t.deposit_receipt_version.append_value(v),
+        None => t.deposit_receipt_version.append_null(),
+    }
+    match get_u256(o, "blobGasUsed") {
+        Some(v) => t.blob_gas_used.append_value(v),
+        None => t.blob_gas_used.append_null(),
+    }
+    match get_u128(o, "l1BaseFeeScalar") {
+        Some(v) => t.l1_base_fee_scalar.append_value(v),
+        None => t.l1_base_fee_scalar.append_null(),
+    }
+    match get_u128(o, "l1BlobBaseFee") {
+        Some(v) => t.l1_blob_base_fee.append_value(v),
+        None => t.l1_blob_base_fee.append_null(),
+    }
+    match get_u128(o, "l1BlobBaseFeeScalar") {
+        Some(v) => t.l1_blob_base_fee_scalar.append_value(v),
+        None => t.l1_blob_base_fee_scalar.append_null(),
+    }
+    match get_u64(o, "l1BlockNumber") {
+        Some(v) => t.l1_block_number.append_value(v),
+        None => t.l1_block_number.append_null(),
+    }
+    match get_u256(o, "mint") {
+        Some(v) => t.mint.append_value(v),
+        None => t.mint.append_null(),
+    }
+    match get_b256(o, "sourceHash") {
+        Some(v) => t.source_hash.append_value(v.as_slice()),
+        None => t.source_hash.append_null(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Functions for selecting columns based on query field selection
+// ---------------------------------------------------------------------------
+
+/// Select the log columns requested by the query's [`LogFields`].
+///
+/// Each `true` field in `fields` corresponds to a column that the caller wants
+/// in the output. Columns not requested are dropped from the batch. If no
+/// fields are set (the query did not specify any log field selection), the
+/// batch is returned unchanged. Unknown field names are silently skipped.
+pub fn select_log_columns(batch: RecordBatch, fields: &LogFields) -> RecordBatch {
+    let requested: &[(&str, bool)] = &[
+        ("removed", fields.removed),
+        ("log_index", fields.log_index),
+        ("transaction_index", fields.transaction_index),
+        ("transaction_hash", fields.transaction_hash),
+        ("block_hash", fields.block_hash),
+        ("block_number", fields.block_number),
+        ("address", fields.address),
+        ("data", fields.data),
+        ("topic0", fields.topic0),
+        ("topic1", fields.topic1),
+        ("topic2", fields.topic2),
+        ("topic3", fields.topic3),
+    ];
+    select_columns(batch, requested)
+}
+
+/// Select the block columns requested by the query's [`BlockFields`].
+///
+/// Each `true` field in `fields` corresponds to a column that the caller wants
+/// in the output. Columns not requested are dropped from the batch. If no
+/// fields are set (the query did not specify any block field selection), the
+/// batch is returned unchanged. Unknown field names are silently skipped.
+pub fn select_block_columns(batch: RecordBatch, fields: &BlockFields) -> RecordBatch {
+    let requested: &[(&str, bool)] = &[
+        ("number", fields.number),
+        ("hash", fields.hash),
+        ("parent_hash", fields.parent_hash),
+        ("nonce", fields.nonce),
+        ("sha3_uncles", fields.sha3_uncles),
+        ("logs_bloom", fields.logs_bloom),
+        ("transactions_root", fields.transactions_root),
+        ("state_root", fields.state_root),
+        ("receipts_root", fields.receipts_root),
+        ("miner", fields.miner),
+        ("difficulty", fields.difficulty),
+        ("total_difficulty", fields.total_difficulty),
+        ("extra_data", fields.extra_data),
+        ("size", fields.size),
+        ("gas_limit", fields.gas_limit),
+        ("gas_used", fields.gas_used),
+        ("timestamp", fields.timestamp),
+        ("uncles", fields.uncles),
+        ("base_fee_per_gas", fields.base_fee_per_gas),
+        ("blob_gas_used", fields.blob_gas_used),
+        ("excess_blob_gas", fields.excess_blob_gas),
+        ("parent_beacon_block_root", fields.parent_beacon_block_root),
+        ("withdrawals_root", fields.withdrawals_root),
+        ("withdrawals", fields.withdrawals),
+        ("l1_block_number", fields.l1_block_number),
+        ("send_count", fields.send_count),
+        ("send_root", fields.send_root),
+        ("mix_hash", fields.mix_hash),
+    ];
+    select_columns(batch, requested)
+}
+
+/// Select the transaction columns requested by the query's [`TransactionFields`].
+///
+/// Each `true` field in `fields` corresponds to a column that the caller wants
+/// in the output. Columns not requested are dropped from the batch. If no
+/// fields are set (the query did not specify any transaction field selection),
+/// the batch is returned unchanged. Unknown field names are silently skipped.
+pub fn select_transaction_columns(batch: RecordBatch, fields: &TransactionFields) -> RecordBatch {
+    let requested: &[(&str, bool)] = &[
+        ("block_hash", fields.block_hash),
+        ("block_number", fields.block_number),
+        ("from", fields.from),
+        ("gas", fields.gas),
+        ("gas_price", fields.gas_price),
+        ("hash", fields.hash),
+        ("input", fields.input),
+        ("nonce", fields.nonce),
+        ("to", fields.to),
+        ("transaction_index", fields.transaction_index),
+        ("value", fields.value),
+        ("v", fields.v),
+        ("r", fields.r),
+        ("s", fields.s),
+        ("max_priority_fee_per_gas", fields.max_priority_fee_per_gas),
+        ("max_fee_per_gas", fields.max_fee_per_gas),
+        ("chain_id", fields.chain_id),
+        ("cumulative_gas_used", fields.cumulative_gas_used),
+        ("effective_gas_price", fields.effective_gas_price),
+        ("gas_used", fields.gas_used),
+        ("contract_address", fields.contract_address),
+        ("logs_bloom", fields.logs_bloom),
+        ("type", fields.type_),
+        ("root", fields.root),
+        ("status", fields.status),
+        ("sighash", fields.sighash),
+        ("y_parity", fields.y_parity),
+        ("access_list", fields.access_list),
+        ("l1_fee", fields.l1_fee),
+        ("l1_gas_price", fields.l1_gas_price),
+        ("l1_fee_scalar", fields.l1_fee_scalar),
+        ("gas_used_for_l1", fields.gas_used_for_l1),
+        ("max_fee_per_blob_gas", fields.max_fee_per_blob_gas),
+        ("blob_versioned_hashes", fields.blob_versioned_hashes),
+        ("deposit_nonce", fields.deposit_nonce),
+        ("blob_gas_price", fields.blob_gas_price),
+        ("deposit_receipt_version", fields.deposit_receipt_version),
+        ("blob_gas_used", fields.blob_gas_used),
+        ("l1_base_fee_scalar", fields.l1_base_fee_scalar),
+        ("l1_blob_base_fee", fields.l1_blob_base_fee),
+        ("l1_blob_base_fee_scalar", fields.l1_blob_base_fee_scalar),
+        ("l1_block_number", fields.l1_block_number),
+        ("mint", fields.mint),
+        ("source_hash", fields.source_hash),
+    ];
+    select_columns(batch, requested)
+}
+
+/// Retain only the columns whose name maps to `true` in `requested`.
+///
+/// Called by the typed `select_*_columns` functions after translating a
+/// `Fields` struct into a `(column_name, is_requested)` slice. Returns the
+/// batch unchanged if no entry is `true`.
+fn select_columns(batch: RecordBatch, requested: &[(&str, bool)]) -> RecordBatch {
+    let any_set = requested.iter().any(|(_, v)| *v);
+    if !any_set {
+        return batch;
+    }
+
+    let schema = batch.schema();
+    let indices: Vec<usize> = requested
+        .iter()
+        .filter(|(_, v)| *v)
+        .filter_map(|(name, _)| schema.index_of(name).ok())
+        .collect();
+
+    batch
+        .project(&indices)
+        .expect("project_columns: column index out of range")
 }
 
 #[cfg(test)]

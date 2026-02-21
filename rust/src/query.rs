@@ -348,6 +348,31 @@ fn has_any_transaction_field(f: &TransactionFields) -> bool {
     )
 }
 
+/// Return `true` if any transaction field *other than `hash`* is set.
+///
+/// Used to determine whether `eth_getBlockByNumber` must be called with `include_txs=true`.
+fn has_tx_fields_except_hash(f: &TransactionFields) -> bool {
+    any_field_set!(
+        f, block_hash, block_number, from, gas, gas_price, input, nonce, to,
+        transaction_index, value, v, r, s, max_priority_fee_per_gas, max_fee_per_gas, chain_id,
+        cumulative_gas_used, effective_gas_price, gas_used, contract_address, logs_bloom, type_,
+        root, status, sighash, y_parity, access_list, l1_fee, l1_gas_price, l1_fee_scalar,
+        gas_used_for_l1, max_fee_per_blob_gas, blob_versioned_hashes, deposit_nonce,
+        blob_gas_price, deposit_receipt_version, blob_gas_used, l1_base_fee_scalar,
+        l1_blob_base_fee, l1_blob_base_fee_scalar, l1_block_number, mint, source_hash,
+    )
+}
+
+/// Return `true` if `eth_getBlockByNumber` must be called with `include_txs=true`.
+///
+/// Full transaction objects are needed when:
+/// - any transaction field other than `hash` is requested (hash-only queries
+///   are satisfied by the tx-hash list that `include_txs=false` already returns), or
+/// - transaction filters are present (filtering requires inspecting tx fields).
+pub(crate) fn get_blocks_needs_full_txs(query: &Query) -> bool {
+    has_tx_fields_except_hash(&query.fields.transaction) || !query.transactions.is_empty()
+}
+
 fn has_any_tx_receipt_field(f: &TransactionFields) -> bool {
     any_field_set!(
         f, cumulative_gas_used, effective_gas_price, gas_used,

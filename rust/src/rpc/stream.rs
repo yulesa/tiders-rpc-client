@@ -13,9 +13,13 @@ use tokio::sync::mpsc;
 use crate::config::ClientConfig;
 use crate::convert::{
     blocks_to_record_batch, clamp_to_block, halved_block_range, logs_to_record_batch,
-    retry_with_block_range, transactions_to_record_batch,
+    retry_with_block_range, select_block_columns, select_log_columns, select_transaction_columns,
+    transactions_to_record_batch,
 };
-use crate::query::{LogRequest, Query, TransactionRequest};
+use crate::query::{
+    get_blocks_needs_full_txs, BlockFields, LogFields, LogRequest, Query, TransactionFields,
+    TransactionRequest,
+};
 use crate::response::ArrowResponse;
 
 use super::block_fetcher::{fetch_blocks, filter_blocks};
@@ -99,7 +103,7 @@ async fn run_historical(
     log_requests: &[LogRequest],
     start_from: u64,
     snapshot_latest_block: u64,
-    _log_fields: crate::query::LogFields,
+    log_fields: LogFields,
     initial_max_block_range: Option<u64>,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
@@ -116,8 +120,9 @@ async fn run_historical(
             Ok(logs) => {
                 let logs_len = logs.len();
                 info!("Fetched {logs_len} logs between blocks {from_block}-{to_block}");
-                
-                let logs_batch = logs_to_record_batch(&logs);
+
+                let logs_batch =
+                    select_log_columns(logs_to_record_batch(&logs), &log_fields);
                 let response = ArrowResponse::with_logs(logs_batch);
 
                 if tx.send(Ok(response)).await.is_err() {
@@ -189,7 +194,7 @@ async fn run_live(
     provider: &RpcProvider,
     log_requests: &[LogRequest],
     start_from: u64,
-    _log_fields: crate::query::LogFields,
+    log_fields: LogFields,
     config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<()> {
@@ -226,7 +231,8 @@ async fn run_live(
                     info!("Live: fetched {logs_len} logs between blocks {from_block}-{to_block}");
                 }
 
-                let logs_batch = logs_to_record_batch(&logs);
+                let logs_batch =
+                    select_log_columns(logs_to_record_batch(&logs), &log_fields);
                 let response = ArrowResponse::with_logs(logs_batch);
 
                 if tx.send(Ok(response)).await.is_err() {
@@ -303,10 +309,17 @@ async fn run_block_stream(
             .context("failed to get current block number for snapshot_latest_block")?,
     };
 
+    let include_txs = get_blocks_needs_full_txs(&query);
+    let block_fields = query.fields.block;
+    let tx_fields = query.fields.transaction;
+
     let next_block = run_block_historical(
         &provider,
         &query.transactions,
         query.include_all_blocks,
+        include_txs,
+        &block_fields,
+        &tx_fields,
         from_block,
         snapshot_latest_block,
         config.max_block_range,
@@ -321,6 +334,9 @@ async fn run_block_stream(
             &provider,
             &query.transactions,
             query.include_all_blocks,
+            include_txs,
+            &block_fields,
+            &tx_fields,
             next_block,
             &config,
             &tx,
@@ -337,6 +353,9 @@ async fn run_block_historical(
     provider: &RpcProvider,
     tx_requests: &[TransactionRequest],
     include_all_blocks: bool,
+    include_txs: bool,
+    block_fields: &BlockFields,
+    tx_fields: &TransactionFields,
     start_from: u64,
     snapshot_latest_block: u64,
     initial_max_block_range: Option<u64>,
@@ -351,15 +370,17 @@ async fn run_block_historical(
 
         debug!("Fetching blocks {from_block}..{to_block}");
 
-        match fetch_blocks(provider, from_block, to_block).await {
+        match fetch_blocks(provider, from_block, to_block, include_txs).await {
             Ok(blocks) => {
                 let num_blocks = blocks.len();
 
                 let (block_rows, tx_rows) =
                     filter_blocks(blocks, tx_requests, include_all_blocks);
 
-                let blocks_batch = blocks_to_record_batch(&block_rows);
-                let txs_batch = transactions_to_record_batch(&tx_rows);
+                let blocks_batch =
+                    select_block_columns(blocks_to_record_batch(&block_rows), block_fields);
+                let txs_batch =
+                    select_transaction_columns(transactions_to_record_batch(&tx_rows), tx_fields);
 
                 info!(
                     "Fetched {num_blocks} blocks between {from_block}-{to_block} \
@@ -427,6 +448,9 @@ async fn run_block_live(
     provider: &RpcProvider,
     tx_requests: &[TransactionRequest],
     include_all_blocks: bool,
+    include_txs: bool,
+    block_fields: &BlockFields,
+    tx_fields: &TransactionFields,
     start_from: u64,
     config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
@@ -455,13 +479,15 @@ async fn run_block_live(
 
         let to_block = safe_head;
 
-        match fetch_blocks(provider, from_block, to_block).await {
+        match fetch_blocks(provider, from_block, to_block, include_txs).await {
             Ok(blocks) => {
                 let (block_rows, tx_rows) =
                     filter_blocks(blocks, tx_requests, include_all_blocks);
 
-                let blocks_batch = blocks_to_record_batch(&block_rows);
-                let txs_batch = transactions_to_record_batch(&tx_rows);
+                let blocks_batch =
+                    select_block_columns(blocks_to_record_batch(&block_rows), block_fields);
+                let txs_batch =
+                    select_transaction_columns(transactions_to_record_batch(&tx_rows), tx_fields);
 
                 if blocks_batch.num_rows() > 0 || txs_batch.num_rows() > 0 {
                     info!(
