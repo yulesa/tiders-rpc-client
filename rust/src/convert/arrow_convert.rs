@@ -1,12 +1,14 @@
 //! Convert alloy RPC types to Arrow `RecordBatch` using `cherry_evm_schema` builders.
 
-use alloy::consensus::Transaction as TransactionTrait;
+use std::collections::HashMap;
+
+use alloy::consensus::{TxReceipt, Transaction as TransactionTrait};
 use alloy::eips::Typed2718;
 use alloy::network::primitives::BlockTransactions;
-use alloy::network::{AnyRpcBlock, TransactionResponse};
-use alloy::primitives::{B256, U128, U256};
+use alloy::network::{AnyRpcBlock, AnyTransactionReceipt, TransactionResponse};
+use alloy::primitives::{TxHash, B256, U128, U256};
 use alloy::rpc::types::Log;
-use arrow::array::builder::{BinaryBuilder, Decimal256Builder};
+use arrow::array::{Array, builder::{BinaryBuilder, Decimal256Builder}};
 use arrow::datatypes::i256;
 use arrow::record_batch::RecordBatch;
 use cherry_evm_schema::{BlocksBuilder, LogsBuilder, TransactionsBuilder};
@@ -807,6 +809,221 @@ fn select_columns(batch: RecordBatch, requested: &[(&str, bool)]) -> RecordBatch
     batch
         .project(&indices)
         .expect("project_columns: column index out of range")
+}
+
+// ---------------------------------------------------------------------------
+// Tx Receipts handlers: patch receipt-only columns into a transactions RecordBatch
+// ---------------------------------------------------------------------------
+// Blocks, Logs, and Transactions are build-from-scratch to a RecordBatch, but
+// for Tx Receipts needs to be patched into the transactions batch.
+// It first build a compact index of receipt data by transaction hash, then
+// iterates through the transactions batch and fills in receipt fields when a matching receipt is found.
+
+/// A compact, indexable view of receipt data needed to populate receipt-only
+/// transaction columns.
+struct TxReceiptRow {
+    cumulative_gas_used: i256,
+    effective_gas_price: i256,
+    gas_used: i256,
+    contract_address: Option<[u8; 20]>,
+    logs_bloom: [u8; 256],
+    /// `Some(bytes)` for pre-EIP-658 state-root receipts, `None` otherwise.
+    root: Option<[u8; 32]>,
+    /// `Some(0 or 1)` for post-EIP-658 status receipts, `None` for pre-EIP-658.
+    status: Option<u8>,
+}
+
+/// Build a `tx_hash → TxReceiptRow` index from a slice of receipts.
+fn index_tx_receipts(receipts: &[AnyTransactionReceipt]) -> HashMap<TxHash, TxReceiptRow> {
+    let mut map = HashMap::with_capacity(receipts.len());
+    for r in receipts {
+        // r       : WithOtherFields<TransactionReceipt<AnyReceiptEnvelope<Log>>>
+        // r.inner : TransactionReceipt<AnyReceiptEnvelope<Log>>
+        // r.inner.inner : AnyReceiptEnvelope<Log>  — implements TxReceipt
+        let envelope = &r.inner.inner;
+
+        let status_or_root = envelope.status_or_post_state();
+
+        let (status, root) = if status_or_root.is_post_state() {
+            // Pre-EIP-658: no boolean status, just a state root
+            let post_state = status_or_root.as_post_state().map(|b| b.0);
+            (None, post_state)
+        } else {
+            // Post-EIP-658: boolean status (true = success = 1)
+            let s: u8 = u8::from(status_or_root.coerce_status());
+            (Some(s), None)
+        };
+
+        let logs_bloom: [u8; 256] = *envelope.bloom().0;
+
+        let row = TxReceiptRow {
+            cumulative_gas_used: u64_to_i256(envelope.cumulative_gas_used()),
+            effective_gas_price: u128_to_i256(r.inner.effective_gas_price),
+            gas_used: u64_to_i256(r.inner.gas_used),
+            contract_address: r.inner.contract_address.map(|a| a.0 .0),
+            logs_bloom,
+            root,
+            status,
+        };
+        map.insert(r.inner.transaction_hash, row);
+    }
+    map
+}
+
+/// Merge receipt data into a transactions `RecordBatch`.
+///
+/// The input `txs_batch` must have been produced by [`transactions_to_record_batch`]
+/// and therefore contains the full `transactions_schema()` with null receipt columns.
+///
+/// For each row in `txs_batch`, we look up the receipt by transaction hash and
+/// fill in the tx receipt fields.
+///
+/// Rows whose hash is not found in `receipts` keep null receipt columns
+/// (this can happen for the `BlockTransactions::Hashes` path when
+/// `include_txs = false`).
+pub fn merge_tx_receipts_into_batch(
+    txs_batch: RecordBatch,
+    receipts: &[AnyTransactionReceipt],
+) -> RecordBatch {
+    if txs_batch.num_rows() == 0 || receipts.is_empty() {
+        return txs_batch;
+    }
+
+    let index = index_tx_receipts(receipts);
+
+    // Collect the tx hashes column to drive the join.
+    let schema = txs_batch.schema();
+    let hash_col_idx = match schema.index_of("hash") {
+        Ok(i) => i,
+        Err(_) => return txs_batch, // no hash column — nothing to merge
+    };
+
+    let hash_col = txs_batch
+        .column(hash_col_idx)
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryArray>();
+
+    let hash_col = match hash_col {
+        Some(c) => c,
+        None => return txs_batch,
+    };
+
+    // Collect per-row receipt values (or None when no receipt found).
+    let n = txs_batch.num_rows();
+    let mut cum_gas: Vec<Option<i256>> = Vec::with_capacity(n);
+    let mut eff_price: Vec<Option<i256>> = Vec::with_capacity(n);
+    let mut gas_used: Vec<Option<i256>> = Vec::with_capacity(n);
+    let mut contract_addr: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+    let mut bloom: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+    let mut root: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+    let mut status: Vec<Option<u8>> = Vec::with_capacity(n);
+
+    for row in 0..n {
+        if hash_col.is_null(row) {
+            cum_gas.push(None);
+            eff_price.push(None);
+            gas_used.push(None);
+            contract_addr.push(None);
+            bloom.push(None);
+            root.push(None);
+            status.push(None);
+            continue;
+        }
+        let hash_bytes = hash_col.value(row);
+        let hash: TxHash = if hash_bytes.len() == 32 {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(hash_bytes);
+            TxHash::from(arr)
+        } else {
+            cum_gas.push(None);
+            eff_price.push(None);
+            gas_used.push(None);
+            contract_addr.push(None);
+            bloom.push(None);
+            root.push(None);
+            status.push(None);
+            continue;
+        };
+
+        match index.get(&hash) {
+            Some(r) => {
+                cum_gas.push(Some(r.cumulative_gas_used));
+                eff_price.push(Some(r.effective_gas_price));
+                gas_used.push(Some(r.gas_used));
+                contract_addr.push(r.contract_address.map(|a| a.to_vec()));
+                bloom.push(Some(r.logs_bloom.to_vec()));
+                root.push(r.root.map(|b| b.to_vec()));
+                status.push(r.status);
+            }
+            None => {
+                cum_gas.push(None);
+                eff_price.push(None);
+                gas_used.push(None);
+                contract_addr.push(None);
+                bloom.push(None);
+                root.push(None);
+                status.push(None);
+            }
+        }
+    }
+
+    // Build a patched RecordBatch: replace the null receipt columns with filled arrays.
+    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> =
+        txs_batch.columns().to_vec();
+
+    let patch_decimal = |vals: &[Option<i256>]| -> std::sync::Arc<dyn arrow::array::Array> {
+        let mut b = Decimal256Builder::new().with_precision_and_scale(76, 0)
+            .expect("valid decimal precision");
+        for v in vals {
+            match v {
+                Some(i) => b.append_value(*i),
+                None => b.append_null(),
+            }
+        }
+        std::sync::Arc::new(b.finish())
+    };
+
+    let patch_binary = |vals: &[Option<Vec<u8>>]| -> std::sync::Arc<dyn arrow::array::Array> {
+        let mut b = BinaryBuilder::new();
+        for v in vals {
+            match v {
+                Some(bytes) => b.append_value(bytes),
+                None => b.append_null(),
+            }
+        }
+        std::sync::Arc::new(b.finish())
+    };
+
+    let patch_u8 = |vals: &[Option<u8>]| -> std::sync::Arc<dyn arrow::array::Array> {
+        let mut b = arrow::array::builder::UInt8Builder::new();
+        for v in vals {
+            match v {
+                Some(i) => b.append_value(*i),
+                None => b.append_null(),
+            }
+        }
+        std::sync::Arc::new(b.finish())
+    };
+
+    // Map column name → new array.
+    let patches: &[(&str, std::sync::Arc<dyn arrow::array::Array>)] = &[
+        ("cumulative_gas_used", patch_decimal(&cum_gas)),
+        ("effective_gas_price", patch_decimal(&eff_price)),
+        ("gas_used",            patch_decimal(&gas_used)),
+        ("contract_address",    patch_binary(&contract_addr)),
+        ("logs_bloom",          patch_binary(&bloom)),
+        ("root",                patch_binary(&root)),
+        ("status",              patch_u8(&status)),
+    ];
+
+    for (name, new_col) in patches {
+        if let Ok(col_idx) = schema.index_of(name) {
+            columns[col_idx] = new_col.clone();
+        }
+    }
+
+    RecordBatch::try_new(txs_batch.schema(), columns)
+        .expect("merge_tx_receipts_into_batch: column count/type mismatch")
 }
 
 #[cfg(test)]

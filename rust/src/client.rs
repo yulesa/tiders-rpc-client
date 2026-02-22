@@ -345,6 +345,118 @@ mod tests {
         }
     }
 
+    /// Streaming query: fetches blocks and their transaction receipts via
+    /// `eth_getBlockReceipts` and saves all chunks to Parquet.
+    ///
+    /// Verifies that receipt-only columns (`gas_used`, `status`,
+    /// `effective_gas_price`, `cumulative_gas_used`, `contract_address`,
+    /// `logs_bloom`) are present and non-empty in the transaction batch.
+    #[tokio::test]
+    async fn stream_blocks_with_receipts() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .parse_default_env()
+            .try_init();
+        let client = make_client();
+
+        let latest_block = client
+            .provider
+            .get_block_number()
+            .await
+            .unwrap_or_else(|e| panic!("failed to get block number: {e}"));
+        log::info!("Latest block: {latest_block}");
+
+        // Use a small range so the test runs quickly.
+        let from_block = latest_block.saturating_sub(5);
+
+        let query = Query {
+            from_block,
+            to_block: Some(latest_block),
+            include_all_blocks: true,
+            logs: Vec::new(),
+            transactions: vec![TransactionRequest {
+                ..TransactionRequest::default()
+            }],
+            traces: Vec::new(),
+            fields: Fields {
+                block: BlockFields {
+                    number: true,
+                    hash: true,
+                    timestamp: true,
+                    ..BlockFields::default()
+                },
+                transaction: TransactionFields {
+                    hash: true,
+                    from: true,
+                    to: true,
+                    // Receipt-only fields:
+                    gas_used: true,
+                    status: true,
+                    effective_gas_price: true,
+                    cumulative_gas_used: true,
+                    contract_address: true,
+                    logs_bloom: true,
+                    ..TransactionFields::default()
+                },
+                log: LogFields::default(),
+                trace: TraceFields::default(),
+            },
+        };
+
+        let mut stream = client
+            .stream(query)
+            .unwrap_or_else(|e| panic!("stream creation failed: {e}"));
+
+        let mut total_tx_rows = 0u64;
+        let mut all_responses: Vec<ArrowResponse> = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            let resp = result.unwrap_or_else(|e| panic!("stream chunk failed: {e}"));
+
+            // Receipt-only columns must be present in the schema.
+            let tx_schema = resp.transactions.schema();
+            assert!(
+                tx_schema.field_with_name("gas_used").is_ok(),
+                "gas_used column missing"
+            );
+            assert!(
+                tx_schema.field_with_name("status").is_ok(),
+                "status column missing"
+            );
+            assert!(
+                tx_schema.field_with_name("effective_gas_price").is_ok(),
+                "effective_gas_price column missing"
+            );
+            assert!(
+                tx_schema.field_with_name("cumulative_gas_used").is_ok(),
+                "cumulative_gas_used column missing"
+            );
+
+            total_tx_rows += resp.transactions.num_rows() as u64;
+            all_responses.push(resp);
+        }
+
+        assert!(
+            total_tx_rows > 0,
+            "stream should have yielded transaction rows with receipt data"
+        );
+
+        log::info!("Streamed {total_tx_rows} tx rows with receipt data");
+
+        let root = Path::new(REPO_ROOT);
+        for (name, extract) in [
+            (
+                "blocks",
+                (|r: &ArrowResponse| r.blocks.clone()) as fn(&ArrowResponse) -> RecordBatch,
+            ),
+            ("transactions", |r| r.transactions.clone()),
+        ] {
+            let batches: Vec<RecordBatch> = all_responses.iter().map(extract).collect();
+            let path = root.join(format!("data/receipt_stream_{name}.parquet"));
+            write_parquet(&path, &batches);
+        }
+    }
+
     fn write_parquet(path: &Path, batches: &[RecordBatch]) {
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return;
@@ -362,5 +474,5 @@ mod tests {
             .close()
             .unwrap_or_else(|e| panic!("ArrowWriter::close: {e}"));
     }
-    
+
 }

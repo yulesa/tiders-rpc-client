@@ -308,16 +308,7 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
         );
     }
 
-    // 4. Unimplemented field selections
-    if has_any_tx_receipt_field(&query.fields.transaction) {
-        let names = collect_tx_receipt_fields(&query.fields.transaction);
-        bail!(
-            "Query selects transaction fields [{}] which require \
-             eth_getTransactionReceipt (not yet implemented).",
-            names.join(", ")
-        );
-    }
-
+    // 4. Unimplemented field selections (trace only — receipt fields are now supported)
     if has_any_trace_field(&query.fields.trace) {
         let names = collect_trace_fields(&query.fields.trace);
         bail!(
@@ -364,6 +355,22 @@ fn has_any_transaction_field(f: &TransactionFields) -> bool {
     )
 }
 
+fn has_any_tx_receipt_field(f: &TransactionFields) -> bool {
+    any_field_set!(
+        f, cumulative_gas_used, effective_gas_price, gas_used,
+        contract_address, logs_bloom, root, status,
+    )
+}
+
+fn has_any_trace_field(f: &TraceFields) -> bool {
+    any_field_set!(
+        f, from, to, call_type, gas, input, init, value, author, reward_type,
+        block_hash, block_number, address, code, gas_used, output, subtraces,
+        trace_address, transaction_hash, transaction_position, type_, error,
+        sighash, action_address, balance, refund_address,
+    )
+}
+
 /// Return `true` if any transaction field *other than `hash`* is set.
 ///
 /// Used to determine whether `eth_getBlockByNumber` must be called with `include_txs=true`.
@@ -387,20 +394,11 @@ pub(crate) fn get_blocks_needs_full_txs(query: &Query) -> bool {
     has_tx_fields_except_hash(&query.fields.transaction)
 }
 
-fn has_any_tx_receipt_field(f: &TransactionFields) -> bool {
-    any_field_set!(
-        f, cumulative_gas_used, effective_gas_price, gas_used,
-        contract_address, logs_bloom, root, status,
-    )
-}
-
-fn has_any_trace_field(f: &TraceFields) -> bool {
-    any_field_set!(
-        f, from, to, call_type, gas, input, init, value, author, reward_type,
-        block_hash, block_number, address, code, gas_used, output, subtraces,
-        trace_address, transaction_hash, transaction_position, type_, error,
-        sighash, action_address, balance, refund_address,
-    )
+/// Return `true` if the query requests any field that only comes from receipt data.
+///
+/// Used by the block pipeline to decide whether to call `eth_getBlockReceipts`.
+pub(crate) fn needs_tx_receipts(query: &Query) -> bool {
+    has_any_tx_receipt_field(&query.fields.transaction)
 }
 
 fn collect_trace_fields(f: &TraceFields) -> Vec<&'static str> {
@@ -410,15 +408,6 @@ fn collect_trace_fields(f: &TraceFields) -> Vec<&'static str> {
         block_hash, block_number, address, code, gas_used, output, subtraces,
         trace_address, transaction_hash, transaction_position, type_, error,
         sighash, action_address, balance, refund_address,
-    );
-    fields
-}
-
-fn collect_tx_receipt_fields(f: &TransactionFields) -> Vec<&'static str> {
-    let fields = collect_set_fields!(
-        f,
-        cumulative_gas_used, effective_gas_price, gas_used,
-        contract_address, logs_bloom, root, status,
     );
     fields
 }

@@ -13,15 +13,19 @@ use tokio::sync::mpsc;
 use crate::config::ClientConfig;
 use crate::convert::{
     blocks_to_record_batch, clamp_to_block, halved_block_range, logs_to_record_batch,
-    retry_with_block_range, select_block_columns, select_log_columns, select_transaction_columns,
-    transactions_to_record_batch,
+    merge_tx_receipts_into_batch, retry_with_block_range, select_block_columns, select_log_columns,
+    select_transaction_columns, transactions_to_record_batch,
 };
-use crate::query::{get_blocks_needs_full_txs, BlockFields, LogFields, LogRequest, Query, TransactionFields};
+use crate::query::{
+    get_blocks_needs_full_txs, needs_tx_receipts, BlockFields, LogFields, LogRequest, Query,
+    TransactionFields,
+};
 use crate::response::ArrowResponse;
 
 use super::block_fetcher::fetch_blocks;
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
+use super::receipt_fetcher::fetch_receipts;
 
 // ===========================================================================
 // Log stream (eth_getLogs pipeline)
@@ -304,12 +308,14 @@ async fn run_block_stream(
     };
 
     let include_txs = get_blocks_needs_full_txs(&query);
+    let fetch_receipts_flag = needs_tx_receipts(&query);
     let block_fields = query.fields.block;
     let tx_fields = query.fields.transaction;
 
     let next_block = run_block_historical(
         &provider,
         include_txs,
+        fetch_receipts_flag,
         &block_fields,
         &tx_fields,
         from_block,
@@ -325,6 +331,7 @@ async fn run_block_stream(
         run_block_live(
             &provider,
             include_txs,
+            fetch_receipts_flag,
             &block_fields,
             &tx_fields,
             next_block,
@@ -338,10 +345,11 @@ async fn run_block_stream(
 }
 
 /// Historical phase for the block pipeline: iterate `[from_block, snapshot]`
-/// in chunks, fetch blocks, and send Arrow responses.
+/// in chunks, fetch blocks (and optionally receipts), and send Arrow responses.
 async fn run_block_historical(
     provider: &RpcProvider,
     include_txs: bool,
+    fetch_receipts_flag: bool,
     block_fields: &BlockFields,
     tx_fields: &TransactionFields,
     start_from: u64,
@@ -364,8 +372,29 @@ async fn run_block_historical(
 
                 let blocks_batch =
                     select_block_columns(blocks_to_record_batch(&blocks), block_fields);
-                let txs_batch =
-                    select_transaction_columns(transactions_to_record_batch(&blocks), tx_fields);
+                let raw_txs_batch = transactions_to_record_batch(&blocks);
+
+                // Optionally fetch receipts and merge into the transactions batch.
+                let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
+                    match fetch_receipts(provider, from_block, to_block).await {
+                        Ok(receipts) => {
+                            info!(
+                                "Fetched {} receipts for blocks {from_block}-{to_block}",
+                                receipts.len()
+                            );
+                            merge_tx_receipts_into_batch(raw_txs_batch, &receipts)
+                        }
+                        Err(e) => {
+                            // Propagate: the error message already contains user guidance
+                            // about switching providers or clients.
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    raw_txs_batch
+                };
+
+                let txs_batch = select_transaction_columns(txs_batch, tx_fields);
 
                 info!(
                     "Fetched {num_blocks} blocks between {from_block}-{to_block} \
@@ -428,6 +457,7 @@ async fn run_block_historical(
 async fn run_block_live(
     provider: &RpcProvider,
     include_txs: bool,
+    fetch_receipts_flag: bool,
     block_fields: &BlockFields,
     tx_fields: &TransactionFields,
     start_from: u64,
@@ -462,8 +492,21 @@ async fn run_block_live(
             Ok(blocks) => {
                 let blocks_batch =
                     select_block_columns(blocks_to_record_batch(&blocks), block_fields);
-                let txs_batch =
-                    select_transaction_columns(transactions_to_record_batch(&blocks), tx_fields);
+                let raw_txs_batch = transactions_to_record_batch(&blocks);
+
+                let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
+                    match fetch_receipts(provider, from_block, to_block).await {
+                        Ok(receipts) => merge_tx_receipts_into_batch(raw_txs_batch, &receipts),
+                        Err(e) => {
+                            // Propagate unsupported-provider error immediately.
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    raw_txs_batch
+                };
+
+                let txs_batch = select_transaction_columns(txs_batch, tx_fields);
 
                 if blocks_batch.num_rows() > 0 || txs_batch.num_rows() > 0 {
                     info!(
