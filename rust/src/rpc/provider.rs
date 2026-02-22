@@ -11,10 +11,7 @@ use alloy::{
         fillers::{BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller},
         Identity, Provider, ProviderBuilder, RootProvider,
     },
-    rpc::{
-        client::RpcClient,
-        types::BlockNumberOrTag,
-    },
+    rpc::{client::RpcClient, types::BlockNumberOrTag},
     transports::{
         http::{reqwest, Http},
         layers::RetryBackoffLayer,
@@ -152,8 +149,7 @@ impl RpcProvider {
                     let mut request_futures = Vec::with_capacity(owned_chunk.len());
 
                     for block_num in &owned_chunk {
-                        let params =
-                            (BlockNumberOrTag::Number(*block_num), include_txs);
+                        let params = (BlockNumberOrTag::Number(*block_num), include_txs);
                         let call = batch
                             .add_call("eth_getBlockByNumber", &params)
                             .map_err(|e| anyhow::anyhow!("failed to add batch call: {e}"))?;
@@ -177,9 +173,7 @@ impl RpcProvider {
                         results.push(block);
                     }
 
-                    Ok::<Vec<AnyRpcBlock>, anyhow::Error>(
-                        results.into_iter().flatten().collect(),
-                    )
+                    Ok::<Vec<AnyRpcBlock>, anyhow::Error>(results.into_iter().flatten().collect())
                 })
             })
             .collect();
@@ -219,19 +213,12 @@ impl RpcProvider {
                 {
                     anyhow::anyhow!(
                         "eth_getBlockReceipts is not supported by this RPC provider.\n\
-                         \n\
                          Fetching receipts one-by-one (eth_getTransactionReceipt) is deliberately \
-                         not implemented because it requires one HTTP request per transaction — \
-                         for a block with 200 transactions that is 200 extra round-trips per block, \
-                         which is extremely slow and expensive.\n\
-                         \n\
-                         To fetch receipt fields (gas_used, status, effective_gas_price, …) please:\n\
-                         • Switch to a provider that supports eth_getBlockReceipts:\n\
-                           Alchemy, QuickNode, Infura, Chainstack, dRPC, Moralis, GetBlock\n\
-                         • Or use a cherry client that does not rely on RPC for receipts:\n\
-                           cherry-sqd-client  — SQD Network (free, archive, fast)\n\
-                           cherry-hypersync-client — HyperSync (Envio, very fast)\n\
-                         \n\
+                         not implemented because it requires one HTTP request per transaction. \
+                         Switch to a provider that supports eth_getBlockReceipts \
+                         (Alchemy, QuickNode, Infura, Chainstack, dRPC, Moralis, GetBlock), \
+                         or use a cherry client that does not rely on RPC calls: \
+                           SQD Network, HyperSync\n\
                          Original provider error: {msg}"
                     )
                 } else {

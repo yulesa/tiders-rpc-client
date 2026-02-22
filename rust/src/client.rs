@@ -41,9 +41,7 @@ impl Client {
         let pipeline = analyze_query(&query)?;
 
         let rx = match pipeline {
-            Pipeline::Log => {
-                start_log_stream(self.provider.clone(), query, self.config.clone())
-            }
+            Pipeline::Log => start_log_stream(self.provider.clone(), query, self.config.clone()),
             Pipeline::Block => {
                 start_block_stream(self.provider.clone(), query, self.config.clone())
             }
@@ -474,5 +472,4 @@ mod tests {
             .close()
             .unwrap_or_else(|e| panic!("ArrowWriter::close: {e}"));
     }
-
 }

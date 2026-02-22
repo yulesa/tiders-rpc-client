@@ -2,13 +2,16 @@
 
 use std::collections::HashMap;
 
-use alloy::consensus::{TxReceipt, Transaction as TransactionTrait};
+use alloy::consensus::{Transaction as TransactionTrait, TxReceipt};
 use alloy::eips::Typed2718;
 use alloy::network::primitives::BlockTransactions;
 use alloy::network::{AnyRpcBlock, AnyTransactionReceipt, TransactionResponse};
 use alloy::primitives::{TxHash, B256, U128, U256};
 use alloy::rpc::types::Log;
-use arrow::array::{Array, builder::{BinaryBuilder, Decimal256Builder}};
+use arrow::array::{
+    builder::{BinaryBuilder, Decimal256Builder},
+    Array,
+};
 use arrow::datatypes::i256;
 use arrow::record_batch::RecordBatch;
 use cherry_evm_schema::{BlocksBuilder, LogsBuilder, TransactionsBuilder};
@@ -133,10 +136,7 @@ pub fn logs_to_record_batch(logs: &[Log]) -> RecordBatch {
     builder.finish()
 }
 
-fn append_topic(
-    builder: &mut BinaryBuilder,
-    topic: Option<&B256>,
-) {
+fn append_topic(builder: &mut BinaryBuilder, topic: Option<&B256>) {
     if let Some(t) = topic {
         builder.append_value(t.as_slice());
     } else {
@@ -196,10 +196,7 @@ pub fn blocks_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
         b.difficulty.append_value(u256_to_i256(hdr.difficulty));
 
         // total_difficulty (Option<U256>)
-        append_optional_u256(
-            &mut b.total_difficulty,
-            block.inner.header.total_difficulty,
-        );
+        append_optional_u256(&mut b.total_difficulty, block.inner.header.total_difficulty);
 
         // extra_data
         b.extra_data.append_value(hdr.extra_data.as_ref());
@@ -260,10 +257,7 @@ pub fn blocks_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
 }
 
 /// Append one row to the withdrawals list builder.
-fn append_withdrawals(
-    wb: &mut cherry_evm_schema::WithdrawalsBuilder,
-    block: &AnyRpcBlock,
-) {
+fn append_withdrawals(wb: &mut cherry_evm_schema::WithdrawalsBuilder, block: &AnyRpcBlock) {
     let list_builder = &mut wb.0;
 
     if let Some(withdrawals) = &block.inner.withdrawals {
@@ -273,16 +267,22 @@ fn append_withdrawals(
             // 2: address (Binary), 3: amount (Decimal256)
             if let Some(fb) = list_builder
                 .values()
-                .field_builder::<arrow::array::builder::UInt64Builder>(0) { fb.append_value(w.index) }
+                .field_builder::<arrow::array::builder::UInt64Builder>(0)
+            {
+                fb.append_value(w.index)
+            }
             if let Some(fb) = list_builder
                 .values()
-                .field_builder::<arrow::array::builder::UInt64Builder>(1) { fb.append_value(w.validator_index) }
-            if let Some(fb) = list_builder
-                .values()
-                .field_builder::<BinaryBuilder>(2) { fb.append_value(w.address.as_slice()) }
-            if let Some(fb) = list_builder
-                .values()
-                .field_builder::<Decimal256Builder>(3) { fb.append_value(u64_to_i256(w.amount)) }
+                .field_builder::<arrow::array::builder::UInt64Builder>(1)
+            {
+                fb.append_value(w.validator_index)
+            }
+            if let Some(fb) = list_builder.values().field_builder::<BinaryBuilder>(2) {
+                fb.append_value(w.address.as_slice())
+            }
+            if let Some(fb) = list_builder.values().field_builder::<Decimal256Builder>(3) {
+                fb.append_value(u64_to_i256(w.amount))
+            }
             list_builder.values().append(true);
         }
         list_builder.append(true);
@@ -378,10 +378,7 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
                     t.gas.append_value(u64_to_i256(tx.gas_limit()));
 
                     // gas_price (Option<u128>) — use the Transaction trait version
-                    append_optional_u128(
-                        &mut t.gas_price,
-                        TransactionTrait::gas_price(tx),
-                    );
+                    append_optional_u128(&mut t.gas_price, TransactionTrait::gas_price(tx));
 
                     // hash
                     t.hash.append_value(tx.tx_hash().as_slice());
@@ -464,17 +461,12 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
                     append_access_list(&mut t.access_list, tx);
 
                     // max_fee_per_blob_gas (Option<u128>)
-                    append_optional_u128(
-                        &mut t.max_fee_per_blob_gas,
-                        tx.max_fee_per_blob_gas(),
-                    );
+                    append_optional_u128(&mut t.max_fee_per_blob_gas, tx.max_fee_per_blob_gas());
 
                     // blob_versioned_hashes
                     if let Some(hashes) = tx.blob_versioned_hashes() {
                         for h in hashes {
-                            t.blob_versioned_hashes
-                                .values()
-                                .append_value(h.as_slice());
+                            t.blob_versioned_hashes.values().append_value(h.as_slice());
                         }
                         t.blob_versioned_hashes.append(true);
                     } else {
@@ -495,10 +487,7 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
 ///
 /// For `AnyTxEnvelope::Ethereum` we can access the signature directly.
 /// For unknown envelope types, we append nulls.
-fn append_signature_fields(
-    t: &mut TransactionsBuilder,
-    tx: &alloy::network::AnyRpcTransaction,
-) {
+fn append_signature_fields(t: &mut TransactionsBuilder, tx: &alloy::network::AnyRpcTransaction) {
     // tx.inner = WithOtherFields<Transaction<AnyTxEnvelope>>
     // tx.inner.inner = Recovered<AnyTxEnvelope> (Deref → AnyTxEnvelope)
     // We go through as_envelope() when available, otherwise append nulls.
@@ -521,10 +510,7 @@ fn append_signature_fields(
 }
 
 /// Append y_parity from the signature.
-fn append_y_parity(
-    t: &mut TransactionsBuilder,
-    tx: &alloy::network::AnyRpcTransaction,
-) {
+fn append_y_parity(t: &mut TransactionsBuilder, tx: &alloy::network::AnyRpcTransaction) {
     match tx.as_envelope() {
         Some(envelope) => {
             t.y_parity.append_value(envelope.signature().v());
@@ -545,9 +531,9 @@ fn append_access_list(
     if let Some(access_list) = tx.access_list() {
         for item in access_list.iter() {
             // Sub-builders: 0 = address (Binary), 1 = storage_keys (List<Binary>)
-            if let Some(fb) = list_builder
-                .values()
-                .field_builder::<BinaryBuilder>(0) { fb.append_value(item.address.as_slice()) }
+            if let Some(fb) = list_builder.values().field_builder::<BinaryBuilder>(0) {
+                fb.append_value(item.address.as_slice())
+            }
 
             let storage_keys_builder = list_builder
                 .values()
@@ -573,10 +559,7 @@ fn append_access_list(
 /// standard fields and land in `WithOtherFields::other` after alloy
 /// deserialisation. Each field is appended as null when absent (e.g. on
 /// mainnet) or when the value cannot be parsed.
-fn append_op_fields(
-    t: &mut TransactionsBuilder,
-    tx: &alloy::network::AnyRpcTransaction,
-) {
+fn append_op_fields(t: &mut TransactionsBuilder, tx: &alloy::network::AnyRpcTransaction) {
     /// Read an optional hex-encoded U128 from `other` and convert to i256.
     fn get_u128(other: &alloy::serde::OtherFields, key: &str) -> Option<i256> {
         let v: U128 = other.get_deserialized::<U128>(key)?.ok()?;
@@ -968,11 +951,11 @@ pub fn merge_tx_receipts_into_batch(
     }
 
     // Build a patched RecordBatch: replace the null receipt columns with filled arrays.
-    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> =
-        txs_batch.columns().to_vec();
+    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = txs_batch.columns().to_vec();
 
     let patch_decimal = |vals: &[Option<i256>]| -> std::sync::Arc<dyn arrow::array::Array> {
-        let mut b = Decimal256Builder::new().with_precision_and_scale(76, 0)
+        let mut b = Decimal256Builder::new()
+            .with_precision_and_scale(76, 0)
             .expect("valid decimal precision");
         for v in vals {
             match v {
@@ -1009,11 +992,11 @@ pub fn merge_tx_receipts_into_batch(
     let patches: &[(&str, std::sync::Arc<dyn arrow::array::Array>)] = &[
         ("cumulative_gas_used", patch_decimal(&cum_gas)),
         ("effective_gas_price", patch_decimal(&eff_price)),
-        ("gas_used",            patch_decimal(&gas_used)),
-        ("contract_address",    patch_binary(&contract_addr)),
-        ("logs_bloom",          patch_binary(&bloom)),
-        ("root",                patch_binary(&root)),
-        ("status",              patch_u8(&status)),
+        ("gas_used", patch_decimal(&gas_used)),
+        ("contract_address", patch_binary(&contract_addr)),
+        ("logs_bloom", patch_binary(&bloom)),
+        ("root", patch_binary(&root)),
+        ("status", patch_u8(&status)),
     ];
 
     for (name, new_col) in patches {
@@ -1042,10 +1025,7 @@ mod tests {
     fn empty_blocks_produce_valid_batch() {
         let batch = blocks_to_record_batch(&[]);
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(
-            batch.schema().as_ref(),
-            &cherry_evm_schema::blocks_schema()
-        );
+        assert_eq!(batch.schema().as_ref(), &cherry_evm_schema::blocks_schema());
     }
 
     #[test]

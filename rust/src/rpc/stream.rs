@@ -126,8 +126,7 @@ async fn run_log_historical(
                 let logs_len = logs.len();
                 info!("Fetched {logs_len} logs between blocks {from_block}-{to_block}");
 
-                let logs_batch =
-                    select_log_columns(logs_to_record_batch(&logs), &log_fields);
+                let logs_batch = select_log_columns(logs_to_record_batch(&logs), &log_fields);
                 let response = ArrowResponse::with_logs(logs_batch);
 
                 if tx.send(Ok(response)).await.is_err() {
@@ -230,8 +229,7 @@ async fn run_log_live(
                     info!("Live: fetched {logs_len} logs between blocks {from_block}-{to_block}");
                 }
 
-                let logs_batch =
-                    select_log_columns(logs_to_record_batch(&logs), &log_fields);
+                let logs_batch = select_log_columns(logs_to_record_batch(&logs), &log_fields);
                 let response = ArrowResponse::with_logs(logs_batch);
 
                 if tx.send(Ok(response)).await.is_err() {
@@ -522,9 +520,7 @@ async fn run_block_live(
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
-                if let Some(retry) =
-                    retry_with_block_range(&err_str, from_block, to_block, None)
-                {
+                if let Some(retry) = retry_with_block_range(&err_str, from_block, to_block, None) {
                     debug!(
                         "Live: block range error, will retry with {}-{}",
                         retry.from, retry.to

@@ -41,7 +41,9 @@ pub async fn fetch_tx_receipts(
 
     let block_numbers: Vec<u64> = (from_block..=to_block).collect();
     let count = block_numbers.len();
-    info!("fetch_tx_receipts: requesting tx receipts for {count} blocks ({from_block}..={to_block})");
+    info!(
+        "fetch_tx_receipts: requesting tx receipts for {count} blocks ({from_block}..={to_block})"
+    );
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TX_RECEIPT_CALLS));
 

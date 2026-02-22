@@ -4,8 +4,8 @@
 //! `FallbackBlockRange` (fetch_logs.rs:933-1022), `calculate_process_historic_log_to_block()`
 //! (fetch_logs.rs:1024-1039), and `halved_block_number()` (helpers/evm_log.rs:141-144).
 
-use regex::Regex;
 use log::{debug, warn};
+use regex::Regex;
 
 /// Result of attempting to parse an error for a suggested block range.
 #[derive(Debug)]
