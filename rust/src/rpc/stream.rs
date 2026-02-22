@@ -16,15 +16,16 @@ use crate::convert::{
     retry_with_block_range, select_block_columns, select_log_columns, select_transaction_columns,
     transactions_to_record_batch,
 };
-use crate::query::{
-    get_blocks_needs_full_txs, BlockFields, LogFields, LogRequest, Query, TransactionFields,
-    TransactionRequest,
-};
+use crate::query::{get_blocks_needs_full_txs, BlockFields, LogFields, LogRequest, Query, TransactionFields};
 use crate::response::ArrowResponse;
 
-use super::block_fetcher::{fetch_blocks, filter_blocks};
+use super::block_fetcher::fetch_blocks;
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
+
+// ===========================================================================
+// Log stream (eth_getLogs pipeline)
+// ===========================================================================
 
 /// Spawn a producer task that fetches logs in block-range batches and sends
 /// `ArrowResponse` chunks through a bounded channel.
@@ -38,7 +39,7 @@ pub fn start_log_stream(
     let (tx, rx) = mpsc::channel(config.buffer_size);
 
     tokio::spawn(async move {
-        if let Err(e) = run_stream(provider, query, config, tx.clone()).await {
+        if let Err(e) = run_log_stream(provider, query, config, tx.clone()).await {
             error!("Log stream terminated with error: {e:#}");
             // Send the error into the channel so the consumer sees it rather
             // than a silent end-of-stream.
@@ -49,7 +50,7 @@ pub fn start_log_stream(
     rx
 }
 
-async fn run_stream(
+async fn run_log_stream(
     provider: RpcProvider,
     query: Query,
     config: ClientConfig,
@@ -67,7 +68,7 @@ async fn run_stream(
     };
 
     // Historical phase
-    let next_block = run_historical(
+    let next_block = run_log_historical(
         &provider,
         &query.logs,
         from_block,
@@ -82,7 +83,7 @@ async fn run_stream(
 
     // Live phase
     if !config.stop_on_head {
-        run_live(
+        run_log_live(
             &provider,
             &query.logs,
             next_block,
@@ -96,9 +97,9 @@ async fn run_stream(
     Ok(())
 }
 
-/// Historical phase: iterate through `[from_block, snapshot_latest_block]` in
+/// Historical phase for the log pipeline: iterate `[from_block, snapshot_latest_block]` in
 /// chunks, shrinking the range on errors.
-async fn run_historical(
+async fn run_log_historical(
     provider: &RpcProvider,
     log_requests: &[LogRequest],
     start_from: u64,
@@ -126,7 +127,7 @@ async fn run_historical(
                 let response = ArrowResponse::with_logs(logs_batch);
 
                 if tx.send(Ok(response)).await.is_err() {
-                    debug!("Stream consumer dropped, stopping historical fetch");
+                    debug!("Stream consumer dropped, stopping historical log fetch");
                     return Ok(from_block);
                 }
 
@@ -161,17 +162,11 @@ async fn run_historical(
                     from_block = retry.from;
                     max_block_range = retry.max_block_range;
                     // Don't advance — retry with the new range.
-                    // We set the clamp so the next iteration uses the new to.
                     continue;
                 }
 
                 // Hard connectivity failures are not recoverable — propagate immediately.
-                if err_str.contains("Connection refused")
-                    || err_str.contains("connection refused")
-                    || err_str.contains("No such host")
-                    || err_str.contains("no such host")
-                    || err_str.contains("failed to lookup")
-                {
+                if is_connection_error(&err_str) {
                     return Err(e);
                 }
 
@@ -189,8 +184,8 @@ async fn run_historical(
     Ok(from_block)
 }
 
-/// Live phase: poll for new blocks and fetch logs.
-async fn run_live(
+/// Live phase for the log pipeline: poll for new blocks and fetch logs.
+async fn run_log_live(
     provider: &RpcProvider,
     log_requests: &[LogRequest],
     start_from: u64,
@@ -236,7 +231,7 @@ async fn run_live(
                 let response = ArrowResponse::with_logs(logs_batch);
 
                 if tx.send(Ok(response)).await.is_err() {
-                    debug!("Stream consumer dropped, stopping live polling");
+                    debug!("Stream consumer dropped, stopping live log polling");
                     return Ok(());
                 }
 
@@ -272,8 +267,7 @@ async fn run_live(
 // ===========================================================================
 
 /// Spawn a producer task that fetches blocks via `eth_getBlockByNumber`,
-/// applies transaction filters, converts to Arrow, and sends
-/// `ArrowResponse` chunks through a bounded channel.
+/// converts to Arrow, and sends `ArrowResponse` chunks through a bounded channel.
 ///
 /// Returns the receiving end of the channel.
 pub fn start_block_stream(
@@ -315,8 +309,6 @@ async fn run_block_stream(
 
     let next_block = run_block_historical(
         &provider,
-        &query.transactions,
-        query.include_all_blocks,
         include_txs,
         &block_fields,
         &tx_fields,
@@ -332,8 +324,6 @@ async fn run_block_stream(
     if !config.stop_on_head {
         run_block_live(
             &provider,
-            &query.transactions,
-            query.include_all_blocks,
             include_txs,
             &block_fields,
             &tx_fields,
@@ -348,11 +338,9 @@ async fn run_block_stream(
 }
 
 /// Historical phase for the block pipeline: iterate `[from_block, snapshot]`
-/// in chunks, fetch blocks, filter, and send Arrow responses.
+/// in chunks, fetch blocks, and send Arrow responses.
 async fn run_block_historical(
     provider: &RpcProvider,
-    tx_requests: &[TransactionRequest],
-    include_all_blocks: bool,
     include_txs: bool,
     block_fields: &BlockFields,
     tx_fields: &TransactionFields,
@@ -374,13 +362,10 @@ async fn run_block_historical(
             Ok(blocks) => {
                 let num_blocks = blocks.len();
 
-                let (block_rows, tx_rows) =
-                    filter_blocks(blocks, tx_requests, include_all_blocks);
-
                 let blocks_batch =
-                    select_block_columns(blocks_to_record_batch(&block_rows), block_fields);
+                    select_block_columns(blocks_to_record_batch(&blocks), block_fields);
                 let txs_batch =
-                    select_transaction_columns(transactions_to_record_batch(&tx_rows), tx_fields);
+                    select_transaction_columns(transactions_to_record_batch(&blocks), tx_fields);
 
                 info!(
                     "Fetched {num_blocks} blocks between {from_block}-{to_block} \
@@ -421,12 +406,8 @@ async fn run_block_historical(
                     continue;
                 }
 
-                if err_str.contains("Connection refused")
-                    || err_str.contains("connection refused")
-                    || err_str.contains("No such host")
-                    || err_str.contains("no such host")
-                    || err_str.contains("failed to lookup")
-                {
+                // Hard connectivity failures are not recoverable — propagate immediately.
+                if is_connection_error(&err_str) {
                     return Err(e);
                 }
 
@@ -446,8 +427,6 @@ async fn run_block_historical(
 /// Live phase for the block pipeline: poll for new blocks.
 async fn run_block_live(
     provider: &RpcProvider,
-    tx_requests: &[TransactionRequest],
-    include_all_blocks: bool,
     include_txs: bool,
     block_fields: &BlockFields,
     tx_fields: &TransactionFields,
@@ -481,13 +460,10 @@ async fn run_block_live(
 
         match fetch_blocks(provider, from_block, to_block, include_txs).await {
             Ok(blocks) => {
-                let (block_rows, tx_rows) =
-                    filter_blocks(blocks, tx_requests, include_all_blocks);
-
                 let blocks_batch =
-                    select_block_columns(blocks_to_record_batch(&block_rows), block_fields);
+                    select_block_columns(blocks_to_record_batch(&blocks), block_fields);
                 let txs_batch =
-                    select_transaction_columns(transactions_to_record_batch(&tx_rows), tx_fields);
+                    select_transaction_columns(transactions_to_record_batch(&blocks), tx_fields);
 
                 if blocks_batch.num_rows() > 0 || txs_batch.num_rows() > 0 {
                     info!(
@@ -525,4 +501,18 @@ async fn run_block_live(
             }
         }
     }
+}
+
+// ===========================================================================
+// Shared helpers
+// ===========================================================================
+
+/// Returns `true` when the error string indicates a hard connectivity failure
+/// that cannot be recovered by retrying with a smaller block range.
+fn is_connection_error(err_str: &str) -> bool {
+    err_str.contains("Connection refused")
+        || err_str.contains("connection refused")
+        || err_str.contains("No such host")
+        || err_str.contains("no such host")
+        || err_str.contains("failed to lookup")
 }

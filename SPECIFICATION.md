@@ -87,34 +87,40 @@ pub struct LogRequest {
 
 ### TransactionRequest
 
-Filters for transactions. Since RPC doesn't support server-side transaction filtering, all transactions from the requested blocks are fetched, and filtering is done client-side.
+Signals that transaction data should be fetched for the requested block range. All filter fields **must be empty** — `cherry-rpc-client` will return an error if any filter is set.
 
 ```rust
 pub struct TransactionRequest {
-    pub from: Vec<[u8; 20]>,        // filter by sender
-    pub to: Vec<[u8; 20]>,          // filter by recipient
-    pub sighash: Vec<[u8; 4]>,      // filter by function selector (first 4 bytes of input)
+    pub from: Vec<[u8; 20]>,                    // MUST be empty — not supported
+    pub to: Vec<[u8; 20]>,                      // MUST be empty — not supported
+    pub sighash: Vec<[u8; 4]>,                  // MUST be empty — not supported
+    pub type_: Vec<u8>,                         // MUST be empty — not supported
+    pub hash: Vec<[u8; 32]>,                    // MUST be empty — not supported
+    pub status: Vec<u8>,                        // MUST be empty — not supported
+    pub contract_deployment_address: Vec<[u8; 20]>, // MUST be empty — not supported
 }
 ```
 
-**RPC mapping:** `eth_getBlockByNumber(blockNum, true)` returns full transaction objects. The client filters them locally by `from`, `to`, and `sighash` (prefix of `input`).
+**Why filters are not supported:** `eth_getBlockByNumber` returns every transaction in a block with no server-side filtering. Every block in the requested range is fetched regardless of any filter. Applying filters inside the client would silently hide that cost — the user would pay for thousands of RPC calls while receiving only a handful of rows, with no indication of the expense. If you need filtered transaction data, use SQD or HyperSync which support server-side filtering, or ingest all transactions with this client and filter post-indexing in your database.
 
-Transaction receipt data (gasUsed, cumulativeGasUsed, effectiveGasPrice, contractAddress, status, logsBloom, etc.) is fetched via `eth_getBlockReceipts` (preferred, fetches all receipts for a block in one call) or `eth_getTransactionReceipt` per matched transaction (fallback).
+**RPC mapping:** `eth_getBlockByNumber(blockNum, true)` returns full transaction objects for all transactions in the block. All transactions are passed through to the output — no in-flight filtering is applied.
+
+Transaction receipt data (gasUsed, cumulativeGasUsed, effectiveGasPrice, contractAddress, status, logsBloom, etc.) is fetched via `eth_getBlockReceipts` (preferred, fetches all receipts for a block in one call) or `eth_getTransactionReceipt` per transaction (fallback).
 
 ### TraceRequest
 
-Filters for traces. Since traces are only available via non-standard methods, the rpc-provider needs to be compatible with parity's trace_transaction.
+Signals that trace data should be fetched. All filter fields **must be empty** — `cherry-rpc-client` will return an error if any filter is set, for the same reason as `TransactionRequest`: the entire block's traces are fetched regardless.
 
 ```rust
 pub struct TraceRequest {
-    pub type_: Vec<String>,         // filter by trace type (call, create, suicide, reward)
-    pub from: Vec<[u8; 20]>,        // filter by from address
-    pub to: Vec<[u8; 20]>,          // filter by to address
-    pub sighash: Vec<[u8; 4]>,      // filter by call sighash
+    pub type_: Vec<String>,         // MUST be empty — not supported
+    pub from: Vec<[u8; 20]>,        // MUST be empty — not supported
+    pub to: Vec<[u8; 20]>,          // MUST be empty — not supported
+    pub sighash: Vec<[u8; 4]>,      // MUST be empty — not supported
 }
 ```
 
-**RPC mapping:** `trace_block(blockNum)` (Parity/OpenEthereum-style). The client filters results locally.
+**RPC mapping:** `trace_block(blockNum)` (Parity/OpenEthereum-style). All traces for the block are returned; filtering is the caller's responsibility post-indexing.
 
 ### Fields
 

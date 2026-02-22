@@ -231,7 +231,10 @@ pub(crate) enum Pipeline {
 /// Returns an error if the query:
 /// - Selects fields that belong to different RPC pipelines (e.g. log fields
 ///   together with block/transaction fields).
-/// - Includes filters for unimplemented pipelines (transaction or trace filters).
+/// - Includes any filter fields on a `TransactionRequest` or `TraceRequest`.
+///   RPC has no server-side filtering for blocks or transactions: every block
+///   in the requested range is fetched unconditionally. Filtering must be done
+///   by the caller after data is ingested (post-indexing).
 /// - Requests fields from unimplemented methods (`eth_getTransactionReceipt`,
 ///   `trace_block` / `debug_traceBlockByNumber`).
 pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
@@ -260,31 +263,44 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
         }
         bail!(
             "Query mixes fields/filters from different RPC pipelines: [{}]. \
-             RPC providers only support a queries that target one pipeline. Split your indexer into separate pipeline and do filter/join post indexing.",
+             RPC providers only support queries that target one pipeline. \
+             Split your indexer into separate pipelines and filter/join post-indexing.",
             pipelines.join(", ")
         );
     }
 
-    // 2. Filters for unimplemented pipelines
+    // 2. TransactionRequest filter fields are not supported.
+    //
+    // eth_getBlockByNumber returns every transaction in a block with no
+    // server-side filtering. Applying filters inside the client would fetch
+    // all blocks anyway and silently hide that cost. Instead, ingest all
+    // transactions and filter in your database post-indexing.
     if !query.transactions.is_empty() {
         for (i, req) in query.transactions.iter().enumerate() {
-            if !req.status.is_empty() || !req.contract_deployment_address.is_empty() {
-                let mut unsupported = Vec::new();
-                if !req.status.is_empty() {
-                    unsupported.push("status");
-                }
-                if !req.contract_deployment_address.is_empty() {
-                    unsupported.push("contract_deployment_address");
-                }
+            let mut unsupported: Vec<&str> = Vec::new();
+            if !req.from.is_empty() { unsupported.push("from"); }
+            if !req.to.is_empty() { unsupported.push("to"); }
+            if !req.sighash.is_empty() { unsupported.push("sighash"); }
+            if !req.type_.is_empty() { unsupported.push("type_"); }
+            if !req.hash.is_empty() { unsupported.push("hash"); }
+            if !req.status.is_empty() { unsupported.push("status"); }
+            if !req.contract_deployment_address.is_empty() {
+                unsupported.push("contract_deployment_address");
+            }
+            if !unsupported.is_empty() {
                 bail!(
-                    "Transaction filter [{}] in transactions[{i}] requires \
-                     eth_getTransactionReceipt which is not yet implemented.",
+                    "transactions[{i}] sets filter fields [{}] which are not supported by the \
+                     RPC block pipeline. eth_getBlockByNumber returns all transactions in a block \
+                     with no server-side filtering — every block in the range is fetched \
+                     regardless. Remove the filters and perform them post-indexing in your \
+                     database instead or use a different cherry client that supports filtering data on source.",
                     unsupported.join(", ")
                 );
             }
         }
     }
 
+    // 3. Trace pipeline is not yet implemented.
     if !query.traces.is_empty() {
         bail!(
             "Query includes trace filters but the trace pipeline \
@@ -292,7 +308,7 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
         );
     }
 
-    // 3. Unimplemented field selections
+    // 4. Unimplemented field selections
     if has_any_tx_receipt_field(&query.fields.transaction) {
         let names = collect_tx_receipt_fields(&query.fields.transaction);
         bail!(
@@ -311,7 +327,7 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
         );
     }
 
-    // 4. Determine pipeline
+    // 5. Determine pipeline
     if uses_log_pipeline {
         Ok(Pipeline::Log)
     } else {
@@ -365,12 +381,10 @@ fn has_tx_fields_except_hash(f: &TransactionFields) -> bool {
 
 /// Return `true` if `eth_getBlockByNumber` must be called with `include_txs=true`.
 ///
-/// Full transaction objects are needed when:
-/// - any transaction field other than `hash` is requested (hash-only queries
-///   are satisfied by the tx-hash list that `include_txs=false` already returns), or
-/// - transaction filters are present (filtering requires inspecting tx fields).
+/// Full transaction objects are needed when any transaction field other than
+/// `hash` is requested.
 pub(crate) fn get_blocks_needs_full_txs(query: &Query) -> bool {
-    has_tx_fields_except_hash(&query.fields.transaction) || !query.transactions.is_empty()
+    has_tx_fields_except_hash(&query.fields.transaction)
 }
 
 fn has_any_tx_receipt_field(f: &TransactionFields) -> bool {
