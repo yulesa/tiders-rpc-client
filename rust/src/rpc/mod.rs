@@ -1,7 +1,7 @@
 pub(crate) mod block_fetcher;
 mod log_fetcher;
 mod provider;
-pub(crate) mod receipt_fetcher;
+pub(crate) mod tx_receipt_fetcher;
 mod stream;
 
 pub(crate) use provider::RpcProvider;

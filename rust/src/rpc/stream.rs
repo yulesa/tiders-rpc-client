@@ -25,7 +25,7 @@ use crate::response::ArrowResponse;
 use super::block_fetcher::fetch_blocks;
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
-use super::receipt_fetcher::fetch_receipts;
+use super::tx_receipt_fetcher::fetch_tx_receipts;
 
 // ===========================================================================
 // Log stream (eth_getLogs pipeline)
@@ -345,7 +345,7 @@ async fn run_block_stream(
 }
 
 /// Historical phase for the block pipeline: iterate `[from_block, snapshot]`
-/// in chunks, fetch blocks (and optionally receipts), and send Arrow responses.
+/// in chunks, fetch blocks (and optionally tx receipts), and send Arrow responses.
 async fn run_block_historical(
     provider: &RpcProvider,
     include_txs: bool,
@@ -374,22 +374,20 @@ async fn run_block_historical(
                     select_block_columns(blocks_to_record_batch(&blocks), block_fields);
                 let raw_txs_batch = transactions_to_record_batch(&blocks);
 
-                // Optionally fetch receipts and merge into the transactions batch.
+                // Optionally fetch tx receipts and merge into the transactions batch.
                 let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-                    match fetch_receipts(provider, from_block, to_block).await {
-                        Ok(receipts) => {
-                            info!(
-                                "Fetched {} receipts for blocks {from_block}-{to_block}",
-                                receipts.len()
-                            );
-                            merge_tx_receipts_into_batch(raw_txs_batch, &receipts)
-                        }
-                        Err(e) => {
-                            // Propagate: the error message already contains user guidance
-                            // about switching providers or clients.
-                            return Err(e);
-                        }
-                    }
+                    let tx_receipts = fetch_tx_receipts_with_retry(
+                        provider,
+                        from_block,
+                        to_block,
+                        max_block_range,
+                    )
+                    .await?;
+                    info!(
+                        "Fetched {} tx receipts for blocks {from_block}-{to_block}",
+                        tx_receipts.len()
+                    );
+                    merge_tx_receipts_into_batch(raw_txs_batch, &tx_receipts)
                 } else {
                     raw_txs_batch
                 };
@@ -495,13 +493,9 @@ async fn run_block_live(
                 let raw_txs_batch = transactions_to_record_batch(&blocks);
 
                 let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-                    match fetch_receipts(provider, from_block, to_block).await {
-                        Ok(receipts) => merge_tx_receipts_into_batch(raw_txs_batch, &receipts),
-                        Err(e) => {
-                            // Propagate unsupported-provider error immediately.
-                            return Err(e);
-                        }
-                    }
+                    let tx_receipts =
+                        fetch_tx_receipts_with_retry(provider, from_block, to_block, None).await?;
+                    merge_tx_receipts_into_batch(raw_txs_batch, &tx_receipts)
                 } else {
                     raw_txs_batch
                 };
@@ -544,6 +538,67 @@ async fn run_block_live(
             }
         }
     }
+}
+
+/// Fetch tx receipts for a block range, automatically retrying with a smaller
+/// window if the provider rejects the request.
+///
+/// When a range is too large, the window is split into smaller sub-windows and each is
+/// fetched separately, accumulating all tx receipts into a single result. Hard
+/// errors (connection failures or unrecognized errors) stop the stream immediately.
+async fn fetch_tx_receipts_with_retry(
+    provider: &RpcProvider,
+    from_block: u64,
+    to_block: u64,
+    initial_max_block_range: Option<u64>,
+) -> Result<Vec<alloy::network::AnyTransactionReceipt>> {
+    let mut all_tx_receipts = Vec::new();
+    let mut sub_from = from_block;
+    let mut max_block_range = initial_max_block_range;
+
+    while sub_from <= to_block {
+        let sub_to = clamp_to_block(sub_from, to_block, max_block_range);
+
+        match fetch_tx_receipts(provider, sub_from, sub_to).await {
+            Ok(tx_receipts) => {
+                all_tx_receipts.extend(tx_receipts);
+                sub_from = sub_to + 1;
+            }
+            Err(e) => {
+                let err_str = format!("{e:#}");
+
+                if let Some(retry) =
+                    retry_with_block_range(&err_str, sub_from, sub_to, max_block_range)
+                {
+                    warn!(
+                        "Tx receipt range error, retrying with {}-{} (was {sub_from}-{sub_to})",
+                        retry.from, retry.to
+                    );
+                    if retry.backoff {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    sub_from = retry.from;
+                    max_block_range = retry.max_block_range;
+                    continue;
+                }
+
+                // Hard connectivity failures are not recoverable — propagate immediately.
+                if is_connection_error(&err_str) {
+                    return Err(e);
+                }
+
+                // Unrecognized error: halve the range and retry, same as the block pipeline.
+                let halved = halved_block_range(sub_from, sub_to);
+                error!(
+                    "Unexpected error fetching tx receipts {sub_from}-{sub_to}, \
+                     retrying {sub_from}-{halved}: {err_str}"
+                );
+                max_block_range = Some(halved.saturating_sub(sub_from));
+            }
+        }
+    }
+
+    Ok(all_tx_receipts)
 }
 
 // ===========================================================================
