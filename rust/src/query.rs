@@ -208,15 +208,6 @@ macro_rules! any_field_set {
     };
 }
 
-/// Collect the names of all `true` bool fields from a struct.
-macro_rules! collect_set_fields {
-    ($obj:expr, $( $field:ident ),+ $(,)?) => {{
-        let mut fields = Vec::new();
-        $( if $obj.$field { fields.push(stringify!($field)); } )+
-        fields
-    }};
-}
-
 /// The RPC pipeline a validated query should use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Pipeline {
@@ -224,6 +215,8 @@ pub(crate) enum Pipeline {
     Block,
     /// `eth_getLogs` — fetches event logs.
     Log,
+    /// `trace_block` or `debug_traceBlockByNumber` — fetches traces.
+    Trace,
 }
 
 /// Validate a query and determine which RPC pipeline it requires.
@@ -232,11 +225,9 @@ pub(crate) enum Pipeline {
 /// - Selects fields that belong to different RPC pipelines (e.g. log fields
 ///   together with block/transaction fields).
 /// - Includes any filter fields on a `TransactionRequest` or `TraceRequest`.
-///   RPC has no server-side filtering for blocks or transactions: every block
-///   in the requested range is fetched unconditionally. Filtering must be done
-///   by the caller after data is ingested (post-indexing).
-/// - Requests fields from unimplemented methods (`eth_getTransactionReceipt`,
-///   `trace_block` / `debug_traceBlockByNumber`).
+///   RPC has no server-side filtering for blocks, transactions, or traces: every
+///   block in the requested range is fetched unconditionally. Filtering must be
+///   done by the caller after data is ingested (post-indexing).
 pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
     let has_log_fields = has_any_log_field(&query.fields.log);
     let has_block_fields = has_any_block_field(&query.fields.block);
@@ -300,30 +291,56 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipeline> {
         }
     }
 
-    // 3. Trace pipeline is not yet implemented.
+    // 3. TraceRequest filter fields are not supported.
+    //
+    // trace_block / debug_traceBlockByNumber returns every trace in a block with
+    // no server-side filtering. Applying filters inside the client would fetch
+    // all traces anyway and silently hide that cost. Instead, ingest all traces
+    // and filter in your database post-indexing.
     if !query.traces.is_empty() {
-        bail!(
-            "Query includes trace filters but the trace pipeline \
-             (trace_block / debug_traceBlockByNumber) is not yet implemented."
-        );
+        for (i, req) in query.traces.iter().enumerate() {
+            let mut unsupported: Vec<&str> = Vec::new();
+            if !req.from.is_empty() { unsupported.push("from"); }
+            if !req.to.is_empty() { unsupported.push("to"); }
+            if !req.address.is_empty() { unsupported.push("address"); }
+            if !req.call_type.is_empty() { unsupported.push("call_type"); }
+            if !req.reward_type.is_empty() { unsupported.push("reward_type"); }
+            if !req.type_.is_empty() { unsupported.push("type_"); }
+            if !req.sighash.is_empty() { unsupported.push("sighash"); }
+            if !req.author.is_empty() { unsupported.push("author"); }
+            if !unsupported.is_empty() {
+                bail!(
+                    "traces[{i}] sets filter fields [{}] which are not supported by the \
+                     RPC trace pipeline. trace_block / debug_traceBlockByNumber returns all \
+                     traces in a block with no server-side filtering — every block in the range \
+                     is fetched regardless. Remove the filters and perform them post-indexing in \
+                     your database instead or use a different cherry client that supports \
+                     filtering data on source.",
+                    unsupported.join(", ")
+                );
+            }
+        }
     }
 
-    // 4. Unimplemented field selections (trace only — receipt fields are now supported)
-    if has_any_trace_field(&query.fields.trace) {
-        let names = collect_trace_fields(&query.fields.trace);
-        bail!(
-            "Query selects trace fields [{}] which require the trace pipeline \
-             (trace_block / debug_traceBlockByNumber, not yet implemented).",
-            names.join(", ")
-        );
-    }
-
-    // 5. Determine pipeline
+    // 4. Determine pipeline
     if uses_log_pipeline {
         Ok(Pipeline::Log)
+    } else if uses_trace_pipeline {
+        Ok(Pipeline::Trace)
     } else {
         Ok(Pipeline::Block)
     }
+}
+
+/// Return the `TraceMethod` to use for the query.
+///
+/// Uses the first `TraceRequest`'s method, defaulting to `TraceBlock`.
+pub(crate) fn get_trace_method(query: &Query) -> TraceMethod {
+    query
+        .traces
+        .first()
+        .map(|r| r.trace_method)
+        .unwrap_or_default()
 }
 
 fn has_any_log_field(f: &LogFields) -> bool {
@@ -401,13 +418,3 @@ pub(crate) fn needs_tx_receipts(query: &Query) -> bool {
     has_any_tx_receipt_field(&query.fields.transaction)
 }
 
-fn collect_trace_fields(f: &TraceFields) -> Vec<&'static str> {
-    let fields = collect_set_fields!(
-        f,
-        from, to, call_type, gas, input, init, value, author, reward_type,
-        block_hash, block_number, address, code, gas_used, output, subtraces,
-        trace_address, transaction_hash, transaction_position, type_, error,
-        sighash, action_address, balance, refund_address,
-    );
-    fields
-}

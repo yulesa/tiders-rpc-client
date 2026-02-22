@@ -7,6 +7,9 @@ use alloy::eips::Typed2718;
 use alloy::network::primitives::BlockTransactions;
 use alloy::network::{AnyRpcBlock, AnyTransactionReceipt, TransactionResponse};
 use alloy::primitives::{TxHash, B256, U128, U256};
+use alloy::rpc::types::trace::parity::{
+    Action, LocalizedTransactionTrace, TraceOutput,
+};
 use alloy::rpc::types::Log;
 use arrow::array::{
     builder::{BinaryBuilder, Decimal256Builder},
@@ -14,9 +17,9 @@ use arrow::array::{
 };
 use arrow::datatypes::i256;
 use arrow::record_batch::RecordBatch;
-use cherry_evm_schema::{BlocksBuilder, LogsBuilder, TransactionsBuilder};
+use cherry_evm_schema::{BlocksBuilder, LogsBuilder, TracesBuilder, TransactionsBuilder};
 
-use crate::query::{BlockFields, LogFields, TransactionFields};
+use crate::query::{BlockFields, LogFields, TraceFields, TransactionFields};
 
 /// Convert a `U256` (unsigned 256-bit) to Arrow's `i256` (signed 256-bit).
 ///
@@ -648,150 +651,207 @@ fn append_op_fields(t: &mut TransactionsBuilder, tx: &alloy::network::AnyRpcTran
 }
 
 // ---------------------------------------------------------------------------
-// Functions for selecting columns based on query field selection
+// Functions for Traces conversion to RecordBatch
 // ---------------------------------------------------------------------------
 
-/// Select the log columns requested by the query's [`LogFields`].
+/// Convert a slice of `LocalizedTransactionTrace` into a `RecordBatch`
+/// matching `traces_schema()`.
 ///
-/// Each `true` field in `fields` corresponds to a column that the caller wants
-/// in the output. Columns not requested are dropped from the batch. If no
-/// fields are set (the query did not specify any log field selection), the
-/// batch is returned unchanged. Unknown field names are silently skipped.
-pub fn select_log_columns(batch: RecordBatch, fields: &LogFields) -> RecordBatch {
-    let requested: &[(&str, bool)] = &[
-        ("removed", fields.removed),
-        ("log_index", fields.log_index),
-        ("transaction_index", fields.transaction_index),
-        ("transaction_hash", fields.transaction_hash),
-        ("block_hash", fields.block_hash),
-        ("block_number", fields.block_number),
-        ("address", fields.address),
-        ("data", fields.data),
-        ("topic0", fields.topic0),
-        ("topic1", fields.topic1),
-        ("topic2", fields.topic2),
-        ("topic3", fields.topic3),
-    ];
-    select_columns(batch, requested)
-}
+/// Each trace produces one row. Fields that are not available for a given
+/// trace type (e.g. `input` on a reward action) are left null.
+pub fn traces_to_record_batch(traces: &[LocalizedTransactionTrace]) -> RecordBatch {
+    let mut t = TracesBuilder::default();
 
-/// Select the block columns requested by the query's [`BlockFields`].
-///
-/// Each `true` field in `fields` corresponds to a column that the caller wants
-/// in the output. Columns not requested are dropped from the batch. If no
-/// fields are set (the query did not specify any block field selection), the
-/// batch is returned unchanged. Unknown field names are silently skipped.
-pub fn select_block_columns(batch: RecordBatch, fields: &BlockFields) -> RecordBatch {
-    let requested: &[(&str, bool)] = &[
-        ("number", fields.number),
-        ("hash", fields.hash),
-        ("parent_hash", fields.parent_hash),
-        ("nonce", fields.nonce),
-        ("sha3_uncles", fields.sha3_uncles),
-        ("logs_bloom", fields.logs_bloom),
-        ("transactions_root", fields.transactions_root),
-        ("state_root", fields.state_root),
-        ("receipts_root", fields.receipts_root),
-        ("miner", fields.miner),
-        ("difficulty", fields.difficulty),
-        ("total_difficulty", fields.total_difficulty),
-        ("extra_data", fields.extra_data),
-        ("size", fields.size),
-        ("gas_limit", fields.gas_limit),
-        ("gas_used", fields.gas_used),
-        ("timestamp", fields.timestamp),
-        ("uncles", fields.uncles),
-        ("base_fee_per_gas", fields.base_fee_per_gas),
-        ("blob_gas_used", fields.blob_gas_used),
-        ("excess_blob_gas", fields.excess_blob_gas),
-        ("parent_beacon_block_root", fields.parent_beacon_block_root),
-        ("withdrawals_root", fields.withdrawals_root),
-        ("withdrawals", fields.withdrawals),
-        ("l1_block_number", fields.l1_block_number),
-        ("send_count", fields.send_count),
-        ("send_root", fields.send_root),
-        ("mix_hash", fields.mix_hash),
-    ];
-    select_columns(batch, requested)
-}
+    for trace in traces {
+        // Collect all per-row field values up-front so each builder gets
+        // exactly one append call per row.
 
-/// Select the transaction columns requested by the query's [`TransactionFields`].
-///
-/// Each `true` field in `fields` corresponds to a column that the caller wants
-/// in the output. Columns not requested are dropped from the batch. If no
-/// fields are set (the query did not specify any transaction field selection),
-/// the batch is returned unchanged. Unknown field names are silently skipped.
-pub fn select_transaction_columns(batch: RecordBatch, fields: &TransactionFields) -> RecordBatch {
-    let requested: &[(&str, bool)] = &[
-        ("block_hash", fields.block_hash),
-        ("block_number", fields.block_number),
-        ("from", fields.from),
-        ("gas", fields.gas),
-        ("gas_price", fields.gas_price),
-        ("hash", fields.hash),
-        ("input", fields.input),
-        ("nonce", fields.nonce),
-        ("to", fields.to),
-        ("transaction_index", fields.transaction_index),
-        ("value", fields.value),
-        ("v", fields.v),
-        ("r", fields.r),
-        ("s", fields.s),
-        ("max_priority_fee_per_gas", fields.max_priority_fee_per_gas),
-        ("max_fee_per_gas", fields.max_fee_per_gas),
-        ("chain_id", fields.chain_id),
-        ("cumulative_gas_used", fields.cumulative_gas_used),
-        ("effective_gas_price", fields.effective_gas_price),
-        ("gas_used", fields.gas_used),
-        ("contract_address", fields.contract_address),
-        ("logs_bloom", fields.logs_bloom),
-        ("type", fields.type_),
-        ("root", fields.root),
-        ("status", fields.status),
-        ("sighash", fields.sighash),
-        ("y_parity", fields.y_parity),
-        ("access_list", fields.access_list),
-        ("l1_fee", fields.l1_fee),
-        ("l1_gas_price", fields.l1_gas_price),
-        ("l1_fee_scalar", fields.l1_fee_scalar),
-        ("gas_used_for_l1", fields.gas_used_for_l1),
-        ("max_fee_per_blob_gas", fields.max_fee_per_blob_gas),
-        ("blob_versioned_hashes", fields.blob_versioned_hashes),
-        ("deposit_nonce", fields.deposit_nonce),
-        ("blob_gas_price", fields.blob_gas_price),
-        ("deposit_receipt_version", fields.deposit_receipt_version),
-        ("blob_gas_used", fields.blob_gas_used),
-        ("l1_base_fee_scalar", fields.l1_base_fee_scalar),
-        ("l1_blob_base_fee", fields.l1_blob_base_fee),
-        ("l1_blob_base_fee_scalar", fields.l1_blob_base_fee_scalar),
-        ("l1_block_number", fields.l1_block_number),
-        ("mint", fields.mint),
-        ("source_hash", fields.source_hash),
-    ];
-    select_columns(batch, requested)
-}
+        // --- action-derived fields ---
+        // `action_address` = the selfdestruct contract address (schema column).
+        // `address`        = selfdestruct contract OR created contract (from result).
+        struct ActionFields {
+            from: Option<Vec<u8>>,
+            to: Option<Vec<u8>>,
+            call_type: Option<String>,
+            gas: Option<i256>,
+            input: Option<Vec<u8>>,
+            init: Option<Vec<u8>>,
+            value: Option<i256>,
+            author: Option<Vec<u8>>,
+            reward_type: Option<String>,
+            /// `action_address` schema column (selfdestruct contract addr).
+            action_address: Option<Vec<u8>>,
+            balance: Option<i256>,
+            refund_address: Option<Vec<u8>>,
+        }
 
-/// Retain only the columns whose name maps to `true` in `requested`.
-///
-/// Called by the typed `select_*_columns` functions after translating a
-/// `Fields` struct into a `(column_name, is_requested)` slice. Returns the
-/// batch unchanged if no entry is `true`.
-fn select_columns(batch: RecordBatch, requested: &[(&str, bool)]) -> RecordBatch {
-    let any_set = requested.iter().any(|(_, v)| *v);
-    if !any_set {
-        return batch;
+        let af = match &trace.trace.action {
+            Action::Call(call) => ActionFields {
+                from: Some(call.from.as_slice().to_vec()),
+                to: Some(call.to.as_slice().to_vec()),
+                call_type: Some(format!("{:?}", call.call_type).to_lowercase()),
+                gas: Some(u64_to_i256(call.gas)),
+                input: Some(call.input.to_vec()),
+                init: None,
+                value: Some(u256_to_i256(call.value)),
+                author: None,
+                reward_type: None,
+                action_address: None,
+                balance: None,
+                refund_address: None,
+            },
+            Action::Create(create) => ActionFields {
+                from: Some(create.from.as_slice().to_vec()),
+                to: None,
+                call_type: Some("create".to_owned()),
+                gas: Some(u64_to_i256(create.gas)),
+                input: None,
+                init: Some(create.init.to_vec()),
+                value: Some(u256_to_i256(create.value)),
+                author: None,
+                reward_type: None,
+                action_address: None,
+                balance: None,
+                refund_address: None,
+            },
+            Action::Selfdestruct(suicide) => ActionFields {
+                from: Some(suicide.address.as_slice().to_vec()),
+                to: Some(suicide.refund_address.as_slice().to_vec()),
+                call_type: Some("selfdestruct".to_owned()),
+                gas: None,
+                input: None,
+                init: None,
+                value: Some(u256_to_i256(suicide.balance)),
+                author: None,
+                reward_type: None,
+                action_address: Some(suicide.address.as_slice().to_vec()),
+                balance: Some(u256_to_i256(suicide.balance)),
+                refund_address: Some(suicide.refund_address.as_slice().to_vec()),
+            },
+            Action::Reward(reward) => ActionFields {
+                from: None,
+                to: None,
+                call_type: None,
+                gas: None,
+                input: None,
+                init: None,
+                value: Some(u256_to_i256(reward.value)),
+                author: Some(reward.author.as_slice().to_vec()),
+                reward_type: Some(format!("{:?}", reward.reward_type).to_lowercase()),
+                action_address: None,
+                balance: None,
+                refund_address: None,
+            },
+        };
+
+        // --- result-derived fields ---
+        let (gas_used, output, result_address, code) = match &trace.trace.result {
+            Some(TraceOutput::Call(call_out)) => (
+                Some(u64_to_i256(call_out.gas_used)),
+                Some(call_out.output.to_vec()),
+                None::<Vec<u8>>,
+                None::<Vec<u8>>,
+            ),
+            Some(TraceOutput::Create(create_out)) => (
+                Some(u64_to_i256(create_out.gas_used)),
+                None,
+                Some(create_out.address.as_slice().to_vec()),
+                Some(create_out.code.to_vec()),
+            ),
+            None => (None, None, None, None),
+        };
+
+        // `address` schema column: created contract address (from result) for
+        // create actions, or selfdestruct contract for selfdestruct actions.
+        let address = result_address.or_else(|| af.action_address.clone());
+
+        // --- append one value per field (schema column order) ---
+        append_opt_binary(&mut t.from, af.from.as_deref());
+        append_opt_binary(&mut t.to, af.to.as_deref());
+        match af.call_type {
+            Some(s) => t.call_type.append_value(s),
+            None => t.call_type.append_null(),
+        }
+        match af.gas {
+            Some(v) => t.gas.append_value(v),
+            None => t.gas.append_null(),
+        }
+        append_opt_binary(&mut t.input, af.input.as_deref());
+        append_opt_binary(&mut t.init, af.init.as_deref());
+        match af.value {
+            Some(v) => t.value.append_value(v),
+            None => t.value.append_null(),
+        }
+        append_opt_binary(&mut t.author, af.author.as_deref());
+        match af.reward_type {
+            Some(s) => t.reward_type.append_value(s),
+            None => t.reward_type.append_null(),
+        }
+        match trace.block_hash {
+            Some(h) => t.block_hash.append_value(h.as_slice()),
+            None => t.block_hash.append_null(),
+        }
+        match trace.block_number {
+            Some(n) => t.block_number.append_value(n),
+            None => t.block_number.append_null(),
+        }
+        append_opt_binary(&mut t.address, address.as_deref());
+        append_opt_binary(&mut t.code, code.as_deref());
+        match gas_used {
+            Some(v) => t.gas_used.append_value(v),
+            None => t.gas_used.append_null(),
+        }
+        append_opt_binary(&mut t.output, output.as_deref());
+        t.subtraces.append_value(trace.trace.subtraces as u64);
+        for idx in &trace.trace.trace_address {
+            t.trace_address.values().append_value(*idx as u64);
+        }
+        t.trace_address.append(true);
+        match trace.transaction_hash {
+            Some(h) => t.transaction_hash.append_value(h.as_slice()),
+            None => t.transaction_hash.append_null(),
+        }
+        match trace.transaction_position {
+            Some(p) => t.transaction_position.append_value(p as u64),
+            None => t.transaction_position.append_null(),
+        }
+        let type_str = match &trace.trace.action {
+            Action::Call(_) => "call",
+            Action::Create(_) => "create",
+            Action::Selfdestruct(_) => "suicide",
+            Action::Reward(_) => "reward",
+        };
+        t.type_.append_value(type_str);
+        match &trace.trace.error {
+            Some(e) => t.error.append_value(e),
+            None => t.error.append_null(),
+        }
+        // sighash: first 4 bytes of input for call actions
+        let sighash = match &trace.trace.action {
+            Action::Call(call) if call.input.len() >= 4 => Some(&call.input[..4]),
+            _ => None,
+        };
+        match sighash {
+            Some(s) => t.sighash.append_value(s),
+            None => t.sighash.append_null(),
+        }
+        append_opt_binary(&mut t.action_address, af.action_address.as_deref());
+        match af.balance {
+            Some(v) => t.balance.append_value(v),
+            None => t.balance.append_null(),
+        }
+        append_opt_binary(&mut t.refund_address, af.refund_address.as_deref());
     }
 
-    let schema = batch.schema();
-    let indices: Vec<usize> = requested
-        .iter()
-        .filter(|(_, v)| *v)
-        .filter_map(|(name, _)| schema.index_of(name).ok())
-        .collect();
+    t.finish()
+}
 
-    batch
-        .project(&indices)
-        .expect("project_columns: column index out of range")
+/// Append an optional byte slice to a `BinaryBuilder`.
+fn append_opt_binary(builder: &mut BinaryBuilder, val: Option<&[u8]>) {
+    match val {
+        Some(b) => builder.append_value(b),
+        None => builder.append_null(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1067,185 @@ pub fn merge_tx_receipts_into_batch(
 
     RecordBatch::try_new(txs_batch.schema(), columns)
         .expect("merge_tx_receipts_into_batch: column count/type mismatch")
+}
+
+// ---------------------------------------------------------------------------
+// Functions for selecting columns based on query field selection
+// ---------------------------------------------------------------------------
+
+/// Select the log columns requested by the query's [`LogFields`].
+///
+/// Each `true` field in `fields` corresponds to a column that the caller wants
+/// in the output. Columns not requested are dropped from the batch. If no
+/// fields are set (the query did not specify any log field selection), the
+/// batch is returned unchanged. Unknown field names are silently skipped.
+pub fn select_log_columns(batch: RecordBatch, fields: &LogFields) -> RecordBatch {
+    let requested: &[(&str, bool)] = &[
+        ("removed", fields.removed),
+        ("log_index", fields.log_index),
+        ("transaction_index", fields.transaction_index),
+        ("transaction_hash", fields.transaction_hash),
+        ("block_hash", fields.block_hash),
+        ("block_number", fields.block_number),
+        ("address", fields.address),
+        ("data", fields.data),
+        ("topic0", fields.topic0),
+        ("topic1", fields.topic1),
+        ("topic2", fields.topic2),
+        ("topic3", fields.topic3),
+    ];
+    select_columns(batch, requested)
+}
+
+/// Select the block columns requested by the query's [`BlockFields`].
+///
+/// Each `true` field in `fields` corresponds to a column that the caller wants
+/// in the output. Columns not requested are dropped from the batch. If no
+/// fields are set (the query did not specify any block field selection), the
+/// batch is returned unchanged. Unknown field names are silently skipped.
+pub fn select_block_columns(batch: RecordBatch, fields: &BlockFields) -> RecordBatch {
+    let requested: &[(&str, bool)] = &[
+        ("number", fields.number),
+        ("hash", fields.hash),
+        ("parent_hash", fields.parent_hash),
+        ("nonce", fields.nonce),
+        ("sha3_uncles", fields.sha3_uncles),
+        ("logs_bloom", fields.logs_bloom),
+        ("transactions_root", fields.transactions_root),
+        ("state_root", fields.state_root),
+        ("receipts_root", fields.receipts_root),
+        ("miner", fields.miner),
+        ("difficulty", fields.difficulty),
+        ("total_difficulty", fields.total_difficulty),
+        ("extra_data", fields.extra_data),
+        ("size", fields.size),
+        ("gas_limit", fields.gas_limit),
+        ("gas_used", fields.gas_used),
+        ("timestamp", fields.timestamp),
+        ("uncles", fields.uncles),
+        ("base_fee_per_gas", fields.base_fee_per_gas),
+        ("blob_gas_used", fields.blob_gas_used),
+        ("excess_blob_gas", fields.excess_blob_gas),
+        ("parent_beacon_block_root", fields.parent_beacon_block_root),
+        ("withdrawals_root", fields.withdrawals_root),
+        ("withdrawals", fields.withdrawals),
+        ("l1_block_number", fields.l1_block_number),
+        ("send_count", fields.send_count),
+        ("send_root", fields.send_root),
+        ("mix_hash", fields.mix_hash),
+    ];
+    select_columns(batch, requested)
+}
+
+/// Select the transaction columns requested by the query's [`TransactionFields`].
+///
+/// Each `true` field in `fields` corresponds to a column that the caller wants
+/// in the output. Columns not requested are dropped from the batch. If no
+/// fields are set (the query did not specify any transaction field selection),
+/// the batch is returned unchanged. Unknown field names are silently skipped.
+pub fn select_transaction_columns(batch: RecordBatch, fields: &TransactionFields) -> RecordBatch {
+    let requested: &[(&str, bool)] = &[
+        ("block_hash", fields.block_hash),
+        ("block_number", fields.block_number),
+        ("from", fields.from),
+        ("gas", fields.gas),
+        ("gas_price", fields.gas_price),
+        ("hash", fields.hash),
+        ("input", fields.input),
+        ("nonce", fields.nonce),
+        ("to", fields.to),
+        ("transaction_index", fields.transaction_index),
+        ("value", fields.value),
+        ("v", fields.v),
+        ("r", fields.r),
+        ("s", fields.s),
+        ("max_priority_fee_per_gas", fields.max_priority_fee_per_gas),
+        ("max_fee_per_gas", fields.max_fee_per_gas),
+        ("chain_id", fields.chain_id),
+        ("cumulative_gas_used", fields.cumulative_gas_used),
+        ("effective_gas_price", fields.effective_gas_price),
+        ("gas_used", fields.gas_used),
+        ("contract_address", fields.contract_address),
+        ("logs_bloom", fields.logs_bloom),
+        ("type", fields.type_),
+        ("root", fields.root),
+        ("status", fields.status),
+        ("sighash", fields.sighash),
+        ("y_parity", fields.y_parity),
+        ("access_list", fields.access_list),
+        ("l1_fee", fields.l1_fee),
+        ("l1_gas_price", fields.l1_gas_price),
+        ("l1_fee_scalar", fields.l1_fee_scalar),
+        ("gas_used_for_l1", fields.gas_used_for_l1),
+        ("max_fee_per_blob_gas", fields.max_fee_per_blob_gas),
+        ("blob_versioned_hashes", fields.blob_versioned_hashes),
+        ("deposit_nonce", fields.deposit_nonce),
+        ("blob_gas_price", fields.blob_gas_price),
+        ("deposit_receipt_version", fields.deposit_receipt_version),
+        ("blob_gas_used", fields.blob_gas_used),
+        ("l1_base_fee_scalar", fields.l1_base_fee_scalar),
+        ("l1_blob_base_fee", fields.l1_blob_base_fee),
+        ("l1_blob_base_fee_scalar", fields.l1_blob_base_fee_scalar),
+        ("l1_block_number", fields.l1_block_number),
+        ("mint", fields.mint),
+        ("source_hash", fields.source_hash),
+    ];
+    select_columns(batch, requested)
+}
+
+/// Select the trace columns requested by the query's [`TraceFields`].
+pub fn select_trace_columns(batch: RecordBatch, fields: &TraceFields) -> RecordBatch {
+    let requested: &[(&str, bool)] = &[
+        ("from", fields.from),
+        ("to", fields.to),
+        ("call_type", fields.call_type),
+        ("gas", fields.gas),
+        ("input", fields.input),
+        ("init", fields.init),
+        ("value", fields.value),
+        ("author", fields.author),
+        ("reward_type", fields.reward_type),
+        ("block_hash", fields.block_hash),
+        ("block_number", fields.block_number),
+        ("address", fields.address),
+        ("code", fields.code),
+        ("gas_used", fields.gas_used),
+        ("output", fields.output),
+        ("subtraces", fields.subtraces),
+        ("trace_address", fields.trace_address),
+        ("transaction_hash", fields.transaction_hash),
+        ("transaction_position", fields.transaction_position),
+        ("type", fields.type_),
+        ("error", fields.error),
+        ("sighash", fields.sighash),
+        ("action_address", fields.action_address),
+        ("balance", fields.balance),
+        ("refund_address", fields.refund_address),
+    ];
+    select_columns(batch, requested)
+}
+
+/// Retain only the columns whose name maps to `true` in `requested`.
+///
+/// Called by the typed `select_*_columns` functions after translating a
+/// `Fields` struct into a `(column_name, is_requested)` slice. Returns the
+/// batch unchanged if no entry is `true`.
+fn select_columns(batch: RecordBatch, requested: &[(&str, bool)]) -> RecordBatch {
+    let any_set = requested.iter().any(|(_, v)| *v);
+    if !any_set {
+        return batch;
+    }
+
+    let schema = batch.schema();
+    let indices: Vec<usize> = requested
+        .iter()
+        .filter(|(_, v)| *v)
+        .filter_map(|(name, _)| schema.index_of(name).ok())
+        .collect();
+
+    batch
+        .project(&indices)
+        .expect("project_columns: column index out of range")
 }
 
 #[cfg(test)]

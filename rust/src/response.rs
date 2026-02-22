@@ -68,6 +68,15 @@ impl ArrowResponse {
             ..Self::empty()
         }
     }
+
+    /// Build a response with only the `traces` RecordBatch populated.
+    /// Other tables are empty with correct schemas.
+    pub fn with_traces(traces: RecordBatch) -> Self {
+        Self {
+            traces,
+            ..Self::empty()
+        }
+    }
 }
 
 fn empty_batch(schema: &arrow::datatypes::Schema) -> RecordBatch {

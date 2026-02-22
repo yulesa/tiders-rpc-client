@@ -8,10 +8,20 @@ use std::time::Duration;
 use alloy::{
     network::{AnyNetwork, AnyRpcBlock, AnyTransactionReceipt},
     providers::{
+        ext::TraceApi,
         fillers::{BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller},
         Identity, Provider, ProviderBuilder, RootProvider,
     },
-    rpc::{client::RpcClient, types::BlockNumberOrTag},
+    rpc::{
+        client::RpcClient,
+        types::{
+            trace::parity::{
+                Action, CallAction, CallOutput, CallType, LocalizedTransactionTrace,
+                TraceOutput, TransactionTrace,
+            },
+            BlockId, BlockNumberOrTag,
+        },
+    },
     transports::{
         http::{reqwest, Http},
         layers::RetryBackoffLayer,
@@ -19,10 +29,13 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use log::{error, info};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::config::ClientConfig;
+use crate::query::TraceMethod;
 
 /// The concrete alloy provider type with default fillers.
 type AlloyProvider = FillProvider<
@@ -189,6 +202,172 @@ impl RpcProvider {
         Ok(all_blocks)
     }
 
+    /// Fetch traces for a single block, dispatching to `trace_block` or
+    /// `debug_traceBlockByNumber` based on `trace_method`.
+    ///
+    /// Returns an error (with user-friendly guidance) if the provider does not
+    /// support block-level tracing. A per-transaction fallback is deliberately
+    /// not implemented — see the error message for alternatives.
+    pub async fn get_block_traces(
+        &self,
+        block_number: u64,
+        trace_method: TraceMethod,
+    ) -> Result<Vec<LocalizedTransactionTrace>> {
+        match trace_method {
+            TraceMethod::TraceBlock => self.trace_block(block_number).await,
+            TraceMethod::DebugTraceBlockByNumber => {
+                self.debug_trace_block_by_number(block_number).await
+            }
+        }
+    }
+
+    /// Call `trace_block(N)` via the alloy trace API.
+    ///
+    /// Adapted from rindexer's `trace_block()` (provider.rs:357-368).
+    async fn trace_block(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<LocalizedTransactionTrace>> {
+        self.provider
+            .trace_block(BlockId::Number(BlockNumberOrTag::Number(block_number)))
+            .await
+            .map_err(|e| {
+                let msg = format!("{e}");
+                if msg.contains("Method not found")
+                    || msg.contains("method not found")
+                    || msg.contains("trace_block")
+                    || msg.contains("not supported")
+                    || msg.contains("unsupported")
+                {
+                    anyhow::anyhow!(
+                        "trace_block is not supported by this RPC provider.\n\
+                         Fetching traces per transaction (debug_traceTransaction) is deliberately \
+                         not implemented because it requires one HTTP request per transaction. \
+                         Either switch to a provider that supports trace_block \
+                         (Erigon, Nethermind, Reth, Alchemy, QuickNode) or configure \
+                         TraceMethod::DebugTraceBlockByNumber if your provider supports it, \
+                         or use a cherry client that does not rely on RPC calls: \
+                           SQD Network, HyperSync\n\
+                         Original provider error: {msg}"
+                    )
+                } else {
+                    anyhow::anyhow!("trace_block failed for block {block_number}: {msg}")
+                }
+            })
+    }
+
+    /// Call `debug_traceBlockByNumber` with `callTracer` and flatten the
+    /// nested call tree into a flat list of `LocalizedTransactionTrace`.
+    ///
+    /// Adapted from rindexer's `debug_trace_block_by_number()` (provider.rs:277-354).
+    /// Uses `onlyTopCall: false` so all nested calls are returned.
+    async fn debug_trace_block_by_number(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<LocalizedTransactionTrace>> {
+        let block = json!(format!("0x{block_number:x}"));
+        let options = json!({ "tracer": "callTracer", "tracerConfig": { "onlyTopCall": false } });
+
+        let raw_frames: Vec<TraceCallFrame> = self
+            .rpc_client
+            .request("debug_traceBlockByNumber", (block, options))
+            .await
+            .map_err(|e| {
+                let msg = format!("{e}");
+                if msg.contains("Method not found")
+                    || msg.contains("method not found")
+                    || msg.contains("debug_traceBlockByNumber")
+                    || msg.contains("not supported")
+                    || msg.contains("unsupported")
+                {
+                    anyhow::anyhow!(
+                        "debug_traceBlockByNumber is not supported by this RPC provider.\n\
+                         Fetching traces per transaction (debug_traceTransaction) is deliberately \
+                         not implemented because it requires one HTTP request per transaction. \
+                         Either switch to a provider that supports debug_traceBlockByNumber \
+                         (Geth, Reth, Erigon, Alchemy, QuickNode, Infura) or configure \
+                         TraceMethod::TraceBlock if your provider supports it, \
+                         or use a cherry client that does not rely on RPC calls: \
+                           SQD Network, HyperSync\n\
+                         Original provider error: {msg}"
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "debug_traceBlockByNumber failed for block {block_number}: {msg}"
+                    )
+                }
+            })?;
+
+        // Flatten the nested call tree into a list of LocalizedTransactionTrace.
+        // Adapted from rindexer's stack-based flattening (provider.rs:294-310).
+        let mut flattened: Vec<TraceCallFrame> = Vec::new();
+        for frame in raw_frames {
+            // Push the top-level call (without its nested calls).
+            flattened.push(TraceCallFrame {
+                tx_hash: frame.tx_hash,
+                result: TraceCall { calls: vec![], ..frame.result.clone() },
+            });
+            // Stack-based DFS to flatten nested calls.
+            let mut stack = frame.result.calls;
+            while let Some(call) = stack.pop() {
+                flattened.push(TraceCallFrame {
+                    tx_hash: None,
+                    result: TraceCall { calls: vec![], ..call.clone() },
+                });
+                stack.extend(call.calls);
+            }
+        }
+
+        // Convert TraceCallFrame → LocalizedTransactionTrace.
+        // Frames where `to` is None (contract creation) are mapped too — we
+        // include them with a zero address to_addr since the schema allows nulls
+        // and the Arrow conversion handles Option<Address>.
+        let traces = flattened
+            .into_iter()
+            .filter_map(|frame| {
+                let to = frame.result.to?; // skip frames with no destination
+                let gas = frame
+                    .result
+                    .gas
+                    .as_deref()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0);
+                let gas_used = frame
+                    .result
+                    .gas_used
+                    .as_deref()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0);
+
+                Some(LocalizedTransactionTrace {
+                    trace: TransactionTrace {
+                        action: Action::Call(CallAction {
+                            from: frame.result.from,
+                            to,
+                            value: frame.result.value,
+                            gas,
+                            input: frame.result.input,
+                            call_type: CallType::Call,
+                        }),
+                        result: Some(TraceOutput::Call(CallOutput {
+                            gas_used,
+                            output: frame.result.output.unwrap_or_default(),
+                        })),
+                        error: frame.result.error,
+                        trace_address: vec![],
+                        subtraces: 0,
+                    },
+                    transaction_hash: frame.tx_hash,
+                    transaction_position: None,
+                    block_number: Some(block_number),
+                    block_hash: None,
+                })
+            })
+            .collect();
+
+        Ok(traces)
+    }
+
     /// Fetch all transaction receipts for a single block via `eth_getBlockReceipts`.
     ///
     /// This is a non-standard but widely-supported RPC method (Alchemy, QuickNode,
@@ -227,4 +406,50 @@ impl RpcProvider {
             })
             .map(|opt| opt.unwrap_or_default())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Custom deserialization types for debug_traceBlockByNumber (callTracer)
+//
+// Adapted from rindexer's TraceCall / TraceCallFrame (provider.rs:112-138).
+// The callTracer returns a nested tree of calls; we flatten it in
+// debug_trace_block_by_number() above.
+// ---------------------------------------------------------------------------
+
+/// A single call frame from the `callTracer` output.
+///
+/// Gas values are hex strings (e.g. `"0x5208"`) rather than numeric types
+/// because the JSON schema varies across providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TraceCall {
+    pub from: alloy::primitives::Address,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas: Option<String>,
+    #[serde(rename = "gasUsed", skip_serializing_if = "Option::is_none")]
+    pub gas_used: Option<String>,
+    pub to: Option<alloy::primitives::Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub input: alloy::primitives::Bytes,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<alloy::primitives::Bytes>,
+    #[serde(default)]
+    pub value: alloy::primitives::U256,
+    #[serde(rename = "type")]
+    pub typ: String,
+    #[serde(default)]
+    pub calls: Vec<TraceCall>,
+}
+
+/// Top-level frame returned by `debug_traceBlockByNumber` with `callTracer`.
+///
+/// Each element in the response array represents one transaction in the block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TraceCallFrame {
+    /// Transaction hash. Some providers omit this field (e.g. zkSync).
+    #[serde(rename = "txHash")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_hash: Option<alloy::primitives::TxHash>,
+    pub result: TraceCall,
 }

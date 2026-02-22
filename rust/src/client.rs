@@ -8,7 +8,7 @@ use futures_lite::Stream;
 use crate::config::ClientConfig;
 use crate::query::{analyze_query, Pipeline, Query};
 use crate::response::ArrowResponse;
-use crate::rpc::{start_block_stream, start_log_stream, RpcProvider};
+use crate::rpc::{start_block_stream, start_log_stream, start_trace_stream, RpcProvider};
 
 pub type DataStream = Pin<Box<dyn Stream<Item = Result<ArrowResponse>> + Send + Sync>>;
 
@@ -44,6 +44,9 @@ impl Client {
             Pipeline::Log => start_log_stream(self.provider.clone(), query, self.config.clone()),
             Pipeline::Block => {
                 start_block_stream(self.provider.clone(), query, self.config.clone())
+            }
+            Pipeline::Trace => {
+                start_trace_stream(self.provider.clone(), query, self.config.clone())
             }
         };
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))

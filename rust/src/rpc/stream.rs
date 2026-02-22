@@ -14,17 +14,19 @@ use crate::config::ClientConfig;
 use crate::convert::{
     blocks_to_record_batch, clamp_to_block, halved_block_range, logs_to_record_batch,
     merge_tx_receipts_into_batch, retry_with_block_range, select_block_columns, select_log_columns,
-    select_transaction_columns, transactions_to_record_batch,
+    select_trace_columns, select_transaction_columns, traces_to_record_batch,
+    transactions_to_record_batch,
 };
 use crate::query::{
-    get_blocks_needs_full_txs, needs_tx_receipts, BlockFields, LogFields, LogRequest, Query,
-    TransactionFields,
+    get_blocks_needs_full_txs, get_trace_method, needs_tx_receipts, BlockFields, LogFields,
+    LogRequest, Query, TraceFields, TraceMethod, TransactionFields,
 };
 use crate::response::ArrowResponse;
 
 use super::block_fetcher::fetch_blocks;
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
+use super::trace_fetcher::fetch_traces;
 use super::tx_receipt_fetcher::fetch_tx_receipts;
 
 // ===========================================================================
@@ -595,6 +597,225 @@ async fn fetch_tx_receipts_with_retry(
     }
 
     Ok(all_tx_receipts)
+}
+
+// ===========================================================================
+// Trace stream (trace_block / debug_traceBlockByNumber pipeline)
+// ===========================================================================
+
+/// Spawn a producer task that fetches traces via `trace_block` or
+/// `debug_traceBlockByNumber`, converts to Arrow, and sends `ArrowResponse`
+/// chunks through a bounded channel.
+///
+/// Returns the receiving end of the channel.
+pub fn start_trace_stream(
+    provider: RpcProvider,
+    query: Query,
+    config: ClientConfig,
+) -> mpsc::Receiver<Result<ArrowResponse>> {
+    let (tx, rx) = mpsc::channel(config.buffer_size);
+
+    tokio::spawn(async move {
+        if let Err(e) = run_trace_stream(provider, query, config, tx.clone()).await {
+            error!("Trace stream terminated with error: {e:#}");
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+
+    rx
+}
+
+async fn run_trace_stream(
+    provider: RpcProvider,
+    query: Query,
+    config: ClientConfig,
+    tx: mpsc::Sender<Result<ArrowResponse>>,
+) -> Result<()> {
+    let from_block = query.from_block;
+
+    let snapshot_latest_block = match query.to_block {
+        Some(to) => to,
+        None => provider
+            .get_block_number()
+            .await
+            .context("failed to get current block number for snapshot_latest_block")?,
+    };
+
+    let trace_method = get_trace_method(&query);
+    let trace_fields = query.fields.trace;
+
+    let next_block = run_trace_historical(
+        &provider,
+        trace_method,
+        &trace_fields,
+        from_block,
+        snapshot_latest_block,
+        config.max_block_range,
+        &tx,
+    )
+    .await?;
+
+    info!("Finished historical trace indexing up to block {snapshot_latest_block}");
+
+    if !config.stop_on_head {
+        run_trace_live(
+            &provider,
+            trace_method,
+            &trace_fields,
+            next_block,
+            &config,
+            &tx,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Historical phase for the trace pipeline.
+async fn run_trace_historical(
+    provider: &RpcProvider,
+    trace_method: TraceMethod,
+    trace_fields: &TraceFields,
+    start_from: u64,
+    snapshot_latest_block: u64,
+    initial_max_block_range: Option<u64>,
+    tx: &mpsc::Sender<Result<ArrowResponse>>,
+) -> Result<u64> {
+    let original_max_range = initial_max_block_range;
+    let mut max_block_range = original_max_range;
+    let mut from_block = start_from;
+
+    while from_block <= snapshot_latest_block {
+        let to_block = clamp_to_block(from_block, snapshot_latest_block, max_block_range);
+
+        debug!("Fetching traces for blocks {from_block}..{to_block}");
+
+        match fetch_traces(provider, from_block, to_block, trace_method).await {
+            Ok(traces) => {
+                let num_traces = traces.len();
+                info!("Fetched {num_traces} traces between blocks {from_block}-{to_block}");
+
+                let traces_batch =
+                    select_trace_columns(traces_to_record_batch(&traces), trace_fields);
+                let response = ArrowResponse::with_traces(traces_batch);
+
+                if tx.send(Ok(response)).await.is_err() {
+                    debug!("Stream consumer dropped, stopping historical trace fetch");
+                    return Ok(from_block);
+                }
+
+                from_block = to_block + 1;
+
+                let mut rng = rand::rng();
+                if rng.random_bool(0.10) {
+                    max_block_range = original_max_range;
+                }
+            }
+            Err(e) => {
+                let err_str = format!("{e:#}");
+
+                if let Some(retry) =
+                    retry_with_block_range(&err_str, from_block, to_block, max_block_range)
+                {
+                    warn!(
+                        "Trace range error, retrying with {}-{} (was {from_block}-{to_block})",
+                        retry.from, retry.to
+                    );
+                    if retry.backoff {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    from_block = retry.from;
+                    max_block_range = retry.max_block_range;
+                    continue;
+                }
+
+                // Hard connectivity failures are not recoverable — propagate immediately.
+                if is_connection_error(&err_str) {
+                    return Err(e);
+                }
+
+                let halved = halved_block_range(from_block, to_block);
+                error!(
+                    "Unexpected error fetching traces {from_block}-{to_block}, \
+                     retrying {from_block}-{halved}: {err_str}"
+                );
+                max_block_range = Some(halved.saturating_sub(from_block));
+            }
+        }
+    }
+
+    Ok(from_block)
+}
+
+/// Live phase for the trace pipeline: poll for new blocks.
+async fn run_trace_live(
+    provider: &RpcProvider,
+    trace_method: TraceMethod,
+    trace_fields: &TraceFields,
+    start_from: u64,
+    config: &ClientConfig,
+    tx: &mpsc::Sender<Result<ArrowResponse>>,
+) -> Result<()> {
+    let poll_interval = Duration::from_millis(config.head_poll_interval_millis);
+    let mut from_block = start_from;
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let head = match provider.get_block_number().await {
+            Ok(h) => h,
+            Err(e) => {
+                error!("Failed to get latest block number: {e:#}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let safe_head = head.saturating_sub(config.reorg_safe_distance);
+
+        if from_block > safe_head {
+            debug!("At head (from_block={from_block}, safe_head={safe_head}), waiting...");
+            continue;
+        }
+
+        let to_block = safe_head;
+
+        match fetch_traces(provider, from_block, to_block, trace_method).await {
+            Ok(traces) => {
+                let num_traces = traces.len();
+
+                if num_traces > 0 {
+                    info!("Live: fetched {num_traces} traces between blocks {from_block}-{to_block}");
+                }
+
+                let traces_batch =
+                    select_trace_columns(traces_to_record_batch(&traces), trace_fields);
+                let response = ArrowResponse::with_traces(traces_batch);
+
+                if tx.send(Ok(response)).await.is_err() {
+                    debug!("Stream consumer dropped, stopping live trace polling");
+                    return Ok(());
+                }
+
+                from_block = to_block + 1;
+            }
+            Err(e) => {
+                let err_str = format!("{e:#}");
+                if let Some(retry) = retry_with_block_range(&err_str, from_block, to_block, None) {
+                    debug!(
+                        "Live: trace range error, will retry with {}-{}",
+                        retry.from, retry.to
+                    );
+                } else {
+                    error!(
+                        "Live: unexpected error fetching traces {from_block}-{to_block}: {err_str}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 // ===========================================================================
