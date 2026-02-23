@@ -28,7 +28,7 @@ use alloy::{
     },
 };
 use anyhow::{Context, Result};
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Semaphore;
@@ -72,6 +72,24 @@ impl RpcProvider {
     /// - `RetryBackoffLayer` for automatic transport-level retries with
     ///   exponential backoff and compute-unit rate limiting
     pub fn new(config: &ClientConfig) -> Result<Self> {
+        // alloy's RetryBackoffLayer uses a single fixed `initial_backoff`; it has
+        // no base/ceiling exponential ramp. These fields are kept in ClientConfig
+        // for API compatibility with other cherry clients but are ignored here.
+        if config.retry_base_ms != 300 {
+            warn!(
+                "retry_base_ms is set but ignored by cherry-rpc-client: alloy's \
+                 RetryBackoffLayer does not implement exponential backoff — it uses a \
+                 fixed initial_backoff (retry_backoff_ms). Set retry_backoff_ms instead."
+            );
+        }
+        if config.retry_ceiling_ms != 10_000 {
+            warn!(
+                "retry_ceiling_ms is set but ignored by cherry-rpc-client: alloy's \
+                 RetryBackoffLayer does not implement a backoff ceiling. \
+                 Set retry_backoff_ms to control the fixed per-retry delay."
+            );
+        }
+
         let rpc_url = Url::parse(&config.url).context("invalid RPC URL")?;
 
         let http_client = reqwest::Client::builder()

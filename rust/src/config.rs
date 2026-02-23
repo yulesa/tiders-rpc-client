@@ -19,7 +19,6 @@ pub struct ClientConfig {
     pub head_poll_interval_millis: u64,
     pub buffer_size: usize,
     pub reorg_safe_distance: u64,
-    pub max_block_range: Option<u64>,
 }
 
 impl ClientConfig {
@@ -35,7 +34,6 @@ impl ClientConfig {
             max_concurrent_requests: None,
             batch_size: None,
             rpc_batch_size: None,
-            max_block_range: None,
             trace_method: None,
             stop_on_head: false,
             head_poll_interval_millis: 1000,

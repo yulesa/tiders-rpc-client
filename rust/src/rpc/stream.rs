@@ -81,7 +81,7 @@ async fn run_log_stream(
         from_block,
         snapshot_latest_block,
         query.fields.log,
-        config.max_block_range,
+        config.batch_size.map(|b| b as u64),
         &tx,
     )
     .await?;
@@ -321,7 +321,7 @@ async fn run_block_stream(
         &tx_fields,
         from_block,
         snapshot_latest_block,
-        config.max_block_range,
+        config.batch_size.map(|b| b as u64),
         &tx,
     )
     .await?;
@@ -651,7 +651,7 @@ async fn run_trace_stream(
         &trace_fields,
         from_block,
         snapshot_latest_block,
-        config.max_block_range,
+        config.batch_size.map(|b| b as u64),
         &tx,
     )
     .await?;

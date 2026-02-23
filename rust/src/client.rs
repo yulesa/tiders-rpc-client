@@ -91,7 +91,7 @@ mod tests {
     fn make_client() -> Client {
         Client::new(ClientConfig {
             stop_on_head: true,
-            max_block_range: Some(500),
+            batch_size: Some(500),
             ..ClientConfig::new(RPC_URL.to_owned())
         })
         .unwrap_or_else(|e| panic!("Failed to create client: {e}"))
