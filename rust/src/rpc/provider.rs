@@ -298,7 +298,8 @@ impl RpcProvider {
                 }
             })?;
 
-        // Flatten the nested call tree into a list of LocalizedTransactionTrace.
+        // Flatten the nested call tree into a list of LocalizedTransactionTrace,
+        // the same format that trace_block produces — so the rest of the pipeline is agnostic to which method was used.
         // Adapted from rindexer's stack-based flattening (provider.rs:294-310).
         let mut flattened: Vec<TraceCallFrame> = Vec::new();
         for frame in raw_frames {

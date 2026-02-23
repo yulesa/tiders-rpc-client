@@ -12,8 +12,9 @@ use tokio::sync::mpsc;
 
 use crate::config::ClientConfig;
 use crate::convert::{
-    blocks_to_record_batch, clamp_to_block, halved_block_range, logs_to_record_batch,
-    merge_tx_receipts_into_batch, retry_with_block_range, select_block_columns, select_log_columns,
+    blocks_to_record_batch, clamp_to_block, halved_block_range, is_fatal_error,
+    logs_to_record_batch, merge_tx_receipts_into_batch, retry_with_block_range,
+    select_block_columns, select_log_columns,
     select_trace_columns, select_transaction_columns, traces_to_record_batch,
     transactions_to_record_batch,
 };
@@ -170,8 +171,8 @@ async fn run_log_historical(
                     continue;
                 }
 
-                // Hard connectivity failures are not recoverable — propagate immediately.
-                if is_connection_error(&err_str) {
+                // Fatal errors are not recoverable — propagate immediately.
+                if is_fatal_error(&err_str) {
                     return Err(e);
                 }
 
@@ -433,8 +434,8 @@ async fn run_block_historical(
                     continue;
                 }
 
-                // Hard connectivity failures are not recoverable — propagate immediately.
-                if is_connection_error(&err_str) {
+                // Fatal errors are not recoverable — propagate immediately.
+                if is_fatal_error(&err_str) {
                     return Err(e);
                 }
 
@@ -580,8 +581,8 @@ async fn fetch_tx_receipts_with_retry(
                     continue;
                 }
 
-                // Hard connectivity failures are not recoverable — propagate immediately.
-                if is_connection_error(&err_str) {
+                // Fatal errors are not recoverable — propagate immediately.
+                if is_fatal_error(&err_str) {
                     return Err(e);
                 }
 
@@ -641,7 +642,7 @@ async fn run_trace_stream(
             .context("failed to get current block number for snapshot_latest_block")?,
     };
 
-    let trace_method = get_trace_method(&query);
+    let trace_method = config.trace_method.unwrap_or_else(|| get_trace_method(&query));
     let trace_fields = query.fields.trace;
 
     let next_block = run_trace_historical(
@@ -730,8 +731,8 @@ async fn run_trace_historical(
                     continue;
                 }
 
-                // Hard connectivity failures are not recoverable — propagate immediately.
-                if is_connection_error(&err_str) {
+                // Fatal errors are not recoverable — propagate immediately.
+                if is_fatal_error(&err_str) {
                     return Err(e);
                 }
 
@@ -821,13 +822,3 @@ async fn run_trace_live(
 // ===========================================================================
 // Shared helpers
 // ===========================================================================
-
-/// Returns `true` when the error string indicates a hard connectivity failure
-/// that cannot be recovered by retrying with a smaller block range.
-fn is_connection_error(err_str: &str) -> bool {
-    err_str.contains("Connection refused")
-        || err_str.contains("connection refused")
-        || err_str.contains("No such host")
-        || err_str.contains("no such host")
-        || err_str.contains("failed to lookup")
-}

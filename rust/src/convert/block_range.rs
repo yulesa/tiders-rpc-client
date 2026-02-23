@@ -63,11 +63,8 @@ pub fn retry_with_block_range(
     warn!("Attempt to parse an RPC block range error (blocks {from_block}-{to_block}): {error_message}");
     let error_lower = truncate_and_lowercase(error_message, 5000);
 
-    // Hard connectivity failures are not recoverable by changing the block range.
-    if error_lower.contains("connection refused")
-        || error_lower.contains("no such host")
-        || error_lower.contains("failed to lookup")
-    {
+    // Fatal errors (connectivity or permanent auth) — no retry.
+    if is_fatal_error_lower(&error_lower) {
         return None;
     }
 
@@ -187,6 +184,32 @@ pub fn retry_with_block_range(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Return `true` if the error is fatal and cannot be resolved by changing the
+/// block range or retrying.
+///
+/// Used by all stream error handlers to propagate immediately instead of
+/// entering the block-range reduction loop.
+pub fn is_fatal_error(err_str: &str) -> bool {
+    is_fatal_error_lower(&truncate_and_lowercase(err_str, 5000))
+}
+
+/// Inner check on an already-lowercased string, used by `retry_with_block_range`.
+fn is_fatal_error_lower(error_lower: &str) -> bool {
+    error_lower.contains("connection refused")
+        || error_lower.contains("no such host")
+        || error_lower.contains("failed to lookup")
+        || error_lower.contains("api key is not allowed")
+        || error_lower.contains("not allowed to access method")
+        || error_lower.contains("unauthorized")
+        || error_lower.contains("authentication failed")
+        || error_lower.contains("invalid api key")
+        || error_lower.contains("access denied")
+        || error_lower.contains("403 forbidden")
+        || error_lower.contains("method not supported")
+        || error_lower.contains("method not found")
+        || error_lower.contains("not supported by this provider")
+}
 
 fn truncate_and_lowercase(s: &str, max_len: usize) -> String {
     s.chars().take(max_len).collect::<String>().to_lowercase()
@@ -421,5 +444,29 @@ mod tests {
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.and_then(|r| r.max_block_range), Some(5000));
+    }
+
+    #[test]
+    fn fatal_errors_are_not_retried() {
+        // Connectivity
+        assert!(is_fatal_error("Connection refused"));
+        assert!(is_fatal_error("No such host"));
+        // Ankr -32053
+        assert!(is_fatal_error(
+            "server returned an error response: error code -32053: API key is not allowed to access method"
+        ));
+        // Generic auth errors
+        assert!(is_fatal_error("Unauthorized"));
+        assert!(is_fatal_error("Access Denied"));
+        assert!(is_fatal_error("403 Forbidden"));
+        assert!(is_fatal_error("method not found"));
+        // Fatal errors return None from retry_with_block_range (no retry).
+        let result = retry_with_block_range(
+            "error code -32053: API key is not allowed to access method",
+            100,
+            200,
+            None,
+        );
+        assert!(result.is_none(), "fatal error should not produce a retry");
     }
 }
