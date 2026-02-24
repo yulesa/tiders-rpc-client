@@ -82,6 +82,7 @@ async fn run_coordinated_stream(
         from_block,
         snapshot_latest_block,
         config.batch_size.map(|b| b as u64),
+        config.retry_backoff_ms,
         &tx,
     )
     .await?;
@@ -108,6 +109,7 @@ async fn run_coordinated_historical(
     start_from: u64,
     snapshot_latest_block: u64,
     initial_max_block_range: Option<u64>,
+    retry_backoff_ms: u64,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
     let mut from_block = start_from;
@@ -117,7 +119,7 @@ async fn run_coordinated_historical(
 
         debug!("Coordinated fetch for blocks {from_block}..{to_block}");
 
-        let response = fetch_all(provider, query, pipelines, from_block, to_block, initial_max_block_range).await?;
+        let response = fetch_all(provider, query, pipelines, from_block, to_block, initial_max_block_range, retry_backoff_ms).await?;
 
         info!(
             "Coordinated batch: {} blocks ({from_block}-{to_block}), \
@@ -158,8 +160,8 @@ async fn run_coordinated_live(
         let head = match provider.get_block_number().await {
             Ok(h) => h,
             Err(e) => {
-                error!("Failed to get latest block number: {e:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
+                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
                 continue;
             }
         };
@@ -173,7 +175,7 @@ async fn run_coordinated_live(
 
         let to_block = safe_head;
 
-        let response = fetch_all(provider, query, pipelines, from_block, to_block, None).await?;
+        let response = fetch_all(provider, query, pipelines, from_block, to_block, None, config.retry_backoff_ms).await?;
 
         let has_data = response.blocks.num_rows() > 0
             || response.transactions.num_rows() > 0
@@ -212,6 +214,7 @@ async fn fetch_all(
     from_block: u64,
     to_block: u64,
     max_block_range: Option<u64>,
+    retry_backoff_ms: u64,
 ) -> Result<ArrowResponse> {
     // --- Block pipeline (blocks + transactions) ---
     let (blocks_batch, txs_batch) = if pipelines.blocks_transactions {
@@ -221,13 +224,13 @@ async fn fetch_all(
         let tx_fields = &query.fields.transaction;
 
         let blocks =
-            fetch_blocks_with_retry(provider, from_block, to_block, include_txs, max_block_range)
+            fetch_blocks_with_retry(provider, from_block, to_block, include_txs, max_block_range, retry_backoff_ms)
                 .await?;
         let blocks_batch = select_block_columns(blocks_to_record_batch(&blocks), block_fields);
         let raw_txs_batch = transactions_to_record_batch(&blocks);
 
         let merged_txs = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-            let receipts = fetch_tx_receipts_with_retry(provider, from_block, to_block, None).await?;
+            let receipts = fetch_tx_receipts_with_retry(provider, from_block, to_block, None, retry_backoff_ms).await?;
             merge_tx_receipts_into_batch(raw_txs_batch, &receipts)
         } else {
             raw_txs_batch
@@ -243,7 +246,7 @@ async fn fetch_all(
     // --- Log pipeline ---
     let logs_batch = if pipelines.logs {
         let log_requests = vec![LogRequest::default()];
-        let logs = fetch_logs_with_retry(provider, &log_requests, from_block, to_block, max_block_range).await?;
+        let logs = fetch_logs_with_retry(provider, &log_requests, from_block, to_block, max_block_range, retry_backoff_ms).await?;
         select_log_columns(logs_to_record_batch(&logs), &query.fields.log)
     } else {
         ArrowResponse::empty().logs
@@ -252,7 +255,7 @@ async fn fetch_all(
     // --- Trace pipeline ---
     let traces_batch = if pipelines.traces {
         let trace_method = get_trace_method(query);
-        let traces = fetch_traces_with_retry(provider, from_block, to_block, trace_method, max_block_range).await?;
+        let traces = fetch_traces_with_retry(provider, from_block, to_block, trace_method, max_block_range, retry_backoff_ms).await?;
         select_trace_columns(traces_to_record_batch(&traces), &query.fields.trace)
     } else {
         ArrowResponse::empty().traces

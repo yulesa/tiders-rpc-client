@@ -82,6 +82,7 @@ async fn run_log_stream(
         snapshot_latest_block,
         query.fields.log,
         config.batch_size.map(|b| b as u64),
+        config.retry_backoff_ms,
         &tx,
     )
     .await?;
@@ -113,6 +114,7 @@ async fn run_log_historical(
     snapshot_latest_block: u64,
     log_fields: LogFields,
     initial_max_block_range: Option<u64>,
+    retry_backoff_ms: u64,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
     let original_max_range = initial_max_block_range;
@@ -158,12 +160,17 @@ async fn run_log_historical(
                 if let Some(retry) =
                     retry_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
-                    warn!(
-                        "Log range error, retrying with {}-{} (was {from_block}-{to_block})",
-                        retry.from, retry.to
-                    );
                     if retry.backoff {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        warn!(
+                            "Log range error, retrying with {}-{} (was {from_block}-{to_block}), backing off {retry_backoff_ms}ms",
+                            retry.from, retry.to
+                        );
+                        tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
+                    } else {
+                        warn!(
+                            "Log range error, retrying with {}-{} (was {from_block}-{to_block})",
+                            retry.from, retry.to
+                        );
                     }
                     from_block = retry.from;
                     max_block_range = retry.max_block_range;
@@ -208,8 +215,8 @@ async fn run_log_live(
         let head = match provider.get_block_number().await {
             Ok(h) => h,
             Err(e) => {
-                error!("Failed to get latest block number: {e:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
+                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
                 continue;
             }
         };
@@ -257,11 +264,11 @@ async fn run_log_live(
                     // Don't advance — the next iteration will clamp naturally.
                 } else {
                     error!(
-                        "Live: unexpected error fetching logs {from_block}-{to_block}: {err_str}"
+                        "Live: unexpected error fetching logs {from_block}-{to_block}: {err_str}, retrying in {}ms",
+                        config.retry_backoff_ms
                     );
                 }
-                // Back off a bit before retrying.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
             }
         }
     }
@@ -322,6 +329,7 @@ async fn run_block_stream(
         from_block,
         snapshot_latest_block,
         config.batch_size.map(|b| b as u64),
+        config.retry_backoff_ms,
         &tx,
     )
     .await?;
@@ -356,6 +364,7 @@ async fn run_block_historical(
     start_from: u64,
     snapshot_latest_block: u64,
     initial_max_block_range: Option<u64>,
+    retry_backoff_ms: u64,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
     let original_max_range = initial_max_block_range;
@@ -381,6 +390,7 @@ async fn run_block_historical(
                         from_block,
                         to_block,
                         max_block_range,
+                        retry_backoff_ms,
                     )
                     .await?;
                     info!(
@@ -421,12 +431,17 @@ async fn run_block_historical(
                 if let Some(retry) =
                     retry_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
-                    warn!(
-                        "Block range error, retrying with {}-{} (was {from_block}-{to_block})",
-                        retry.from, retry.to
-                    );
                     if retry.backoff {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        warn!(
+                            "Block range error, retrying with {}-{} (was {from_block}-{to_block}), backing off {retry_backoff_ms}ms",
+                            retry.from, retry.to
+                        );
+                        tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
+                    } else {
+                        warn!(
+                            "Block range error, retrying with {}-{} (was {from_block}-{to_block})",
+                            retry.from, retry.to
+                        );
                     }
                     from_block = retry.from;
                     max_block_range = retry.max_block_range;
@@ -471,8 +486,8 @@ async fn run_block_live(
         let head = match provider.get_block_number().await {
             Ok(h) => h,
             Err(e) => {
-                error!("Failed to get latest block number: {e:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
+                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
                 continue;
             }
         };
@@ -494,7 +509,7 @@ async fn run_block_live(
 
                 let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
                     let tx_receipts =
-                        fetch_tx_receipts_with_retry(provider, from_block, to_block, None).await?;
+                        fetch_tx_receipts_with_retry(provider, from_block, to_block, None, config.retry_backoff_ms).await?;
                     merge_tx_receipts_into_batch(raw_txs_batch, &tx_receipts)
                 } else {
                     raw_txs_batch
@@ -529,10 +544,11 @@ async fn run_block_live(
                     );
                 } else {
                     error!(
-                        "Live: unexpected error fetching blocks {from_block}-{to_block}: {err_str}"
+                        "Live: unexpected error fetching blocks {from_block}-{to_block}: {err_str}, retrying in {}ms",
+                        config.retry_backoff_ms
                     );
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
             }
         }
     }
@@ -590,6 +606,7 @@ async fn run_trace_stream(
         from_block,
         snapshot_latest_block,
         config.batch_size.map(|b| b as u64),
+        config.retry_backoff_ms,
         &tx,
     )
     .await?;
@@ -619,6 +636,7 @@ async fn run_trace_historical(
     start_from: u64,
     snapshot_latest_block: u64,
     initial_max_block_range: Option<u64>,
+    retry_backoff_ms: u64,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
     let original_max_range = initial_max_block_range;
@@ -657,12 +675,17 @@ async fn run_trace_historical(
                 if let Some(retry) =
                     retry_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
-                    warn!(
-                        "Trace range error, retrying with {}-{} (was {from_block}-{to_block})",
-                        retry.from, retry.to
-                    );
                     if retry.backoff {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        warn!(
+                            "Trace range error, retrying with {}-{} (was {from_block}-{to_block}), backing off {retry_backoff_ms}ms",
+                            retry.from, retry.to
+                        );
+                        tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
+                    } else {
+                        warn!(
+                            "Trace range error, retrying with {}-{} (was {from_block}-{to_block})",
+                            retry.from, retry.to
+                        );
                     }
                     from_block = retry.from;
                     max_block_range = retry.max_block_range;
@@ -705,8 +728,8 @@ async fn run_trace_live(
         let head = match provider.get_block_number().await {
             Ok(h) => h,
             Err(e) => {
-                error!("Failed to get latest block number: {e:#}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
+                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
                 continue;
             }
         };
@@ -748,10 +771,11 @@ async fn run_trace_live(
                     );
                 } else {
                     error!(
-                        "Live: unexpected error fetching traces {from_block}-{to_block}: {err_str}"
+                        "Live: unexpected error fetching traces {from_block}-{to_block}: {err_str}, retrying in {}ms",
+                        config.retry_backoff_ms
                     );
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
             }
         }
     }

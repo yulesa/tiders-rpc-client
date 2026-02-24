@@ -92,6 +92,7 @@ pub(super) async fn fetch_tx_receipts_with_retry(
     from_block: u64,
     to_block: u64,
     initial_max_block_range: Option<u64>,
+    retry_backoff_ms: u64,
 ) -> Result<Vec<AnyTransactionReceipt>> {
     let mut all_receipts: Vec<AnyTransactionReceipt> = Vec::new();
     let mut sub_from = from_block;
@@ -112,11 +113,11 @@ pub(super) async fn fetch_tx_receipts_with_retry(
                     retry_with_block_range(&err_str, sub_from, sub_to, max_block_range)
                 {
                     warn!(
-                        "Tx receipt range error, retrying {}-{} (was {sub_from}-{sub_to})",
+                        "Tx receipt range error, retrying {}-{} (was {sub_from}-{sub_to}), backing off {retry_backoff_ms}ms",
                         retry.from, retry.to
                     );
                     if retry.backoff {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
                     }
                     sub_from = retry.from;
                     max_block_range = retry.max_block_range;
