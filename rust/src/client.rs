@@ -6,9 +6,11 @@ use arrow::record_batch::RecordBatch;
 use futures_lite::Stream;
 
 use crate::config::ClientConfig;
-use crate::query::{analyze_query, Pipeline, Query};
+use crate::query::{analyze_query, Query};
 use crate::response::ArrowResponse;
-use crate::rpc::{start_block_stream, start_log_stream, start_trace_stream, RpcProvider};
+use crate::rpc::{
+    start_block_stream, start_coordinated_stream, start_log_stream, start_trace_stream, RpcProvider,
+};
 
 pub type DataStream = Pin<Box<dyn Stream<Item = Result<ArrowResponse>> + Send + Sync>>;
 
@@ -34,20 +36,26 @@ impl Client {
     /// Start a streaming query that yields `ArrowResponse` chunks.
     ///
     /// Selects the appropriate pipeline based on the query:
-    /// - If log requests are present, uses the `eth_getLogs` pipeline.
-    /// - Otherwise (block/transaction fields requested), uses the
-    ///   `eth_getBlockByNumber` pipeline.
+    /// - If the query requires, uses the coordinated multi-pipeline stream.
+    /// - If only blocks and/or tx, uses the `eth_getBlockByNumber` pipeline.
+    /// - If only log requests are present, uses the `eth_getLogs` pipeline.
+    /// - If only trace requests are present, uses the `trace_block` pipeline.
     pub fn stream(&self, query: Query) -> Result<DataStream> {
-        let pipeline = analyze_query(&query)?;
+        let pipelines = analyze_query(&query)?;
 
-        let rx = match pipeline {
-            Pipeline::Log => start_log_stream(self.provider.clone(), query, self.config.clone()),
-            Pipeline::Block => {
-                start_block_stream(self.provider.clone(), query, self.config.clone())
-            }
-            Pipeline::Trace => {
-                start_trace_stream(self.provider.clone(), query, self.config.clone())
-            }
+        let rx = if pipelines.needs_coordinator() {
+            start_coordinated_stream(
+                self.provider.clone(),
+                query,
+                self.config.clone(),
+                pipelines,
+            )
+        } else if pipelines.logs {
+            start_log_stream(self.provider.clone(), query, self.config.clone())
+        } else if pipelines.traces {
+            start_trace_stream(self.provider.clone(), query, self.config.clone())
+        } else {
+            start_block_stream(self.provider.clone(), query, self.config.clone())
         };
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }

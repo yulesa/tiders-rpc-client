@@ -3,13 +3,17 @@
 //! Adapted from rindexer's `get_logs()` and `get_logs_for_address_in_batches()`
 //! (provider.rs:566-640).
 
+use std::time::Duration;
+
 use alloy::{
     primitives::{Address as AlloyAddress, B256},
     providers::Provider,
     rpc::types::{Filter, Log, ValueOrArray},
 };
 use anyhow::{Context, Result};
+use log::{error, warn};
 
+use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_with_block_range};
 use crate::query::LogRequest;
 
 use super::provider::RpcProvider;
@@ -100,6 +104,62 @@ pub async fn fetch_logs_for_request(
     for handle in handles {
         let logs = handle.await.context("address batch task panicked")??;
         all_logs.extend(logs);
+    }
+
+    Ok(all_logs)
+}
+
+/// Fetch logs for `[from_block, to_block]`, automatically splitting into narrower
+/// sub-ranges on provider block-range errors and accumulating results.
+pub(super) async fn fetch_logs_with_retry(
+    provider: &RpcProvider,
+    requests: &[LogRequest],
+    from_block: u64,
+    to_block: u64,
+    initial_max_block_range: Option<u64>,
+) -> Result<Vec<Log>> {
+    let mut all_logs: Vec<Log> = Vec::new();
+    let mut sub_from = from_block;
+    let mut max_block_range = initial_max_block_range;
+
+    while sub_from <= to_block {
+        let sub_to = clamp_to_block(sub_from, to_block, max_block_range);
+
+        match fetch_logs(provider, requests, sub_from, sub_to).await {
+            Ok(logs) => {
+                all_logs.extend(logs);
+                sub_from = sub_to + 1;
+            }
+            Err(e) => {
+                let err_str = format!("{e:#}");
+
+                if let Some(retry) =
+                    retry_with_block_range(&err_str, sub_from, sub_to, max_block_range)
+                {
+                    warn!(
+                        "Log pipeline range error, retrying {}-{} (was {sub_from}-{sub_to})",
+                        retry.from, retry.to
+                    );
+                    if retry.backoff {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    sub_from = retry.from;
+                    max_block_range = retry.max_block_range;
+                    continue;
+                }
+
+                if is_fatal_error(&err_str) {
+                    return Err(e);
+                }
+
+                let halved = halved_block_range(sub_from, sub_to);
+                error!(
+                    "Log pipeline unexpected error {sub_from}-{sub_to}, \
+                     retrying {sub_from}-{halved}: {err_str}"
+                );
+                max_block_range = Some(halved.saturating_sub(sub_from));
+            }
+        }
     }
 
     Ok(all_logs)

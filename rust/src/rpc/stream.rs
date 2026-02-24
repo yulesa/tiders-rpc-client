@@ -28,7 +28,7 @@ use super::block_fetcher::fetch_blocks;
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces;
-use super::tx_receipt_fetcher::fetch_tx_receipts;
+use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
 
 // ===========================================================================
 // Log stream (eth_getLogs pipeline)
@@ -371,8 +371,7 @@ async fn run_block_historical(
             Ok(blocks) => {
                 let num_blocks = blocks.len();
 
-                let blocks_batch =
-                    select_block_columns(blocks_to_record_batch(&blocks), block_fields);
+                let blocks_batch = select_block_columns(blocks_to_record_batch(&blocks), block_fields);
                 let raw_txs_batch = transactions_to_record_batch(&blocks);
 
                 // Optionally fetch tx receipts and merge into the transactions batch.
@@ -537,67 +536,6 @@ async fn run_block_live(
             }
         }
     }
-}
-
-/// Fetch tx receipts for a block range, automatically retrying with a smaller
-/// window if the provider rejects the request.
-///
-/// When a range is too large, the window is split into smaller sub-windows and each is
-/// fetched separately, accumulating all tx receipts into a single result. Hard
-/// errors (connection failures or unrecognized errors) stop the stream immediately.
-async fn fetch_tx_receipts_with_retry(
-    provider: &RpcProvider,
-    from_block: u64,
-    to_block: u64,
-    initial_max_block_range: Option<u64>,
-) -> Result<Vec<alloy::network::AnyTransactionReceipt>> {
-    let mut all_tx_receipts = Vec::new();
-    let mut sub_from = from_block;
-    let mut max_block_range = initial_max_block_range;
-
-    while sub_from <= to_block {
-        let sub_to = clamp_to_block(sub_from, to_block, max_block_range);
-
-        match fetch_tx_receipts(provider, sub_from, sub_to).await {
-            Ok(tx_receipts) => {
-                all_tx_receipts.extend(tx_receipts);
-                sub_from = sub_to + 1;
-            }
-            Err(e) => {
-                let err_str = format!("{e:#}");
-
-                if let Some(retry) =
-                    retry_with_block_range(&err_str, sub_from, sub_to, max_block_range)
-                {
-                    warn!(
-                        "Tx receipt range error, retrying with {}-{} (was {sub_from}-{sub_to})",
-                        retry.from, retry.to
-                    );
-                    if retry.backoff {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                    sub_from = retry.from;
-                    max_block_range = retry.max_block_range;
-                    continue;
-                }
-
-                // Fatal errors are not recoverable — propagate immediately.
-                if is_fatal_error(&err_str) {
-                    return Err(e);
-                }
-
-                // Unrecognized error: halve the range and retry, same as the block pipeline.
-                let halved = halved_block_range(sub_from, sub_to);
-                error!(
-                    "Unexpected error fetching tx receipts {sub_from}-{sub_to}, \
-                     retrying {sub_from}-{halved}: {err_str}"
-                );
-                max_block_range = Some(halved.saturating_sub(sub_from));
-            }
-        }
-    }
-
-    Ok(all_tx_receipts)
 }
 
 // ===========================================================================
