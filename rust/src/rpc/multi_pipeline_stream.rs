@@ -1,9 +1,14 @@
-//! Coordinated multi-pipeline stream.
+//! Multi-pipeline stream.
 //!
-//! When a query has `include_*` flags set on its request types, a single RPC
-//! pipeline is not enough.  This module runs more than one pipelines over the 
-//! **same block range** in each batch, then merges the results into one 
-//! [`ArrowResponse`] with all four tables populated.
+//! When a query requires more than one RPC pipeline (e.g. via `include_*`
+//! flags), this module runs all needed pipelines over the **same block range**
+//! in each batch, then merges the results into one [`ArrowResponse`] with all
+//! four tables populated.
+//!
+//! Each pipeline has its own internal retry loop that accumulates data across
+//! sub-ranges, so the response is only sent after the full batch range is
+//! covered. This means `batch_size` directly controls the memory used per
+//! response.
 
 use std::time::Duration;
 
@@ -237,7 +242,7 @@ async fn fetch_all(
 
     // --- Log pipeline ---
     let logs_batch = if pipelines.logs {
-        let log_requests: vec![LogRequest::default()];
+        let log_requests = vec![LogRequest::default()];
         let logs = fetch_logs_with_retry(provider, &log_requests, from_block, to_block, max_block_range).await?;
         select_log_columns(logs_to_record_batch(&logs), &query.fields.log)
     } else {

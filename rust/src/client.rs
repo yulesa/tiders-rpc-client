@@ -4,6 +4,7 @@ use std::pin::Pin;
 use anyhow::{Context, Result};
 use arrow::record_batch::RecordBatch;
 use futures_lite::Stream;
+use log::{info, warn};
 
 use crate::config::ClientConfig;
 use crate::query::{analyze_query, Query};
@@ -44,17 +45,34 @@ impl Client {
         let pipelines = analyze_query(&query)?;
 
         let rx = if pipelines.needs_coordinator() {
+            let mut config = self.config.clone();
+            if config.batch_size.is_none() {
+                config.batch_size = Some(100);
+                warn!(
+                    "Multi-pipeline stream requires a batch_size. \
+                     Defaulting to 100 blocks per batch. The client accumulates all \
+                     pipeline data for the full batch range before sending each response. \
+                     Set batch_size in ClientConfig to control memory usage and response granularity."
+                );
+            }
+            info!(
+                "Starting multi-pipeline stream (blocks_transactions={}, logs={}, traces={})",
+                pipelines.blocks_transactions, pipelines.logs, pipelines.traces
+            );
             start_coordinated_stream(
                 self.provider.clone(),
                 query,
-                self.config.clone(),
+                config,
                 pipelines,
             )
         } else if pipelines.logs {
+            info!("Starting log stream");
             start_log_stream(self.provider.clone(), query, self.config.clone())
         } else if pipelines.traces {
+            info!("Starting trace stream");
             start_trace_stream(self.provider.clone(), query, self.config.clone())
         } else {
+            info!("Starting block stream");
             start_block_stream(self.provider.clone(), query, self.config.clone())
         };
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))

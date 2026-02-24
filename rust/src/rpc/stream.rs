@@ -159,7 +159,7 @@ async fn run_log_historical(
                     retry_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
                     warn!(
-                        "Block range error, retrying with {}-{} (was {from_block}-{to_block})",
+                        "Log range error, retrying with {}-{} (was {from_block}-{to_block})",
                         retry.from, retry.to
                     );
                     if retry.backoff {

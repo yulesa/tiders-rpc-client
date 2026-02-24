@@ -11,7 +11,7 @@ use alloy::{
     rpc::types::{Filter, Log, ValueOrArray},
 };
 use anyhow::{Context, Result};
-use log::{error, warn};
+use log::{error, info, warn};
 
 use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_with_block_range};
 use crate::query::LogRequest;
@@ -37,6 +37,10 @@ pub async fn fetch_logs(
         return Ok(Vec::new());
     }
 
+    info!(
+        "fetch_logs: requesting logs for blocks ({from_block}..={to_block})",
+    );
+
     let mut all_logs = Vec::new();
     for req in requests {
         let logs = fetch_logs_for_request(provider, req, from_block, to_block).await?;
@@ -51,6 +55,11 @@ pub async fn fetch_logs(
         }
         a.log_index.cmp(&b.log_index)
     });
+
+    info!(
+        "fetch_logs: received {} logs for range {from_block}..={to_block}",
+        all_logs.len()
+    );
 
     Ok(all_logs)
 }
