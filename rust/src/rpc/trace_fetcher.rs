@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use log::{error, info, warn};
 use tokio::sync::Semaphore;
 
-use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_with_block_range};
+use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_logs_with_block_range};
 use crate::query::TraceMethod;
 
 use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
@@ -120,7 +120,7 @@ pub(super) async fn fetch_traces_with_retry(
                 let err_str = format!("{e:#}");
 
                 if let Some(retry) =
-                    retry_with_block_range(&err_str, sub_from, sub_to, max_block_range)
+                    retry_logs_with_block_range(&err_str, sub_from, sub_to, max_block_range)
                 {
                     warn!(
                         "Trace pipeline range error, retrying {}-{} (was {sub_from}-{sub_to}), backing off {retry_backoff_ms}ms",

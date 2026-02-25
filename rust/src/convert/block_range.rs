@@ -1,6 +1,6 @@
 //! Block range management and provider-specific error recovery.
 //!
-//! Ported from rindexer's `retry_with_block_range()` (fetch_logs.rs:725-931),
+//! Ported from rindexer's `retry_logs_with_block_range()` (fetch_logs.rs:725-931),
 //! `FallbackBlockRange` (fetch_logs.rs:933-1022), `calculate_process_historic_log_to_block()`
 //! (fetch_logs.rs:1024-1039), and `halved_block_number()` (helpers/evm_log.rs:141-144).
 
@@ -54,7 +54,7 @@ pub fn halved_block_range(from_block: u64, to_block: u64) -> u64 {
 /// providers report block range errors.
 ///
 /// Returns `None` if the error is not a block-range error.
-pub fn retry_with_block_range(
+pub fn retry_logs_with_block_range(
     error_message: &str,
     from_block: u64,
     to_block: u64,
@@ -194,7 +194,7 @@ pub fn is_fatal_error(err_str: &str) -> bool {
     is_fatal_error_lower(&truncate_and_lowercase(err_str, 5000))
 }
 
-/// Inner check on an already-lowercased string, used by `retry_with_block_range`.
+/// Inner check on an already-lowercased string, used by `retry_logs_with_block_range`.
 fn is_fatal_error_lower(error_lower: &str) -> bool {
     error_lower.contains("connection refused")
         || error_lower.contains("no such host")
@@ -386,7 +386,7 @@ mod tests {
     fn alchemy_error_parsing() {
         // 0x100=256, 0x200=512, range=256 → max_block_range becomes 256
         let msg = "this block range should work: [0x100, 0x200]";
-        let result = retry_with_block_range(msg, 100, 1000, None);
+        let result = retry_logs_with_block_range(msg, 100, 1000, None);
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.map(|r| r.from), Some(0x100));
@@ -398,7 +398,7 @@ mod tests {
     fn infura_error_parsing() {
         // from=10, to=255, range=245 → max_block_range becomes 245
         let msg = "try with this block range [0xa, 0xff]";
-        let result = retry_with_block_range(msg, 5, 1000, None);
+        let result = retry_logs_with_block_range(msg, 5, 1000, None);
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.map(|r| r.from), Some(10));
@@ -409,7 +409,7 @@ mod tests {
     #[test]
     fn ankr_error_parsing() {
         let msg = "block range is too wide";
-        let result = retry_with_block_range(msg, 100, 10000, None);
+        let result = retry_logs_with_block_range(msg, 100, 10000, None);
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.map(|r| r.from), Some(100));
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn quicknode_limited_to_parsing() {
         let msg = "limited to a 10,000";
-        let result = retry_with_block_range(msg, 100, 50000, None);
+        let result = retry_logs_with_block_range(msg, 100, 50000, None);
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.map(|r| r.from), Some(100));
@@ -430,7 +430,7 @@ mod tests {
     #[test]
     fn base_error_parsing() {
         let msg = "block range too large";
-        let result = retry_with_block_range(msg, 100, 10000, Some(1500));
+        let result = retry_logs_with_block_range(msg, 100, 10000, Some(1500));
         let r = result.as_ref();
         assert!(r.is_some());
         // pick_min_range(Some(1500), 2000) => 1500
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn fallback_range_from_large_diff() {
         let msg = "some unknown error";
-        let result = retry_with_block_range(msg, 0, 10000, None);
+        let result = retry_logs_with_block_range(msg, 0, 10000, None);
         let r = result.as_ref();
         assert!(r.is_some());
         assert_eq!(r.and_then(|r| r.max_block_range), Some(5000));
@@ -460,8 +460,8 @@ mod tests {
         assert!(is_fatal_error("Access Denied"));
         assert!(is_fatal_error("403 Forbidden"));
         assert!(is_fatal_error("method not found"));
-        // Fatal errors return None from retry_with_block_range (no retry).
-        let result = retry_with_block_range(
+        // Fatal errors return None from retry_logs_with_block_range (no retry).
+        let result = retry_logs_with_block_range(
             "error code -32053: API key is not allowed to access method",
             100,
             200,

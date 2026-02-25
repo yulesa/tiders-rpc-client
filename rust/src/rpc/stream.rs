@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::config::ClientConfig;
 use crate::convert::{
     blocks_to_record_batch, clamp_to_block, halved_block_range, is_fatal_error,
-    logs_to_record_batch, merge_tx_receipts_into_batch, retry_with_block_range,
+    logs_to_record_batch, merge_tx_receipts_into_batch, retry_logs_with_block_range,
     select_block_columns, select_log_columns,
     select_trace_columns, select_transaction_columns, traces_to_record_batch,
     transactions_to_record_batch,
@@ -158,7 +158,7 @@ async fn run_log_historical(
                 let err_str = format!("{e:#}");
 
                 if let Some(retry) =
-                    retry_with_block_range(&err_str, from_block, to_block, max_block_range)
+                    retry_logs_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
                     if retry.backoff {
                         warn!(
@@ -256,7 +256,7 @@ async fn run_log_live(
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
-                if let Some(retry) = retry_with_block_range(&err_str, from_block, to_block, None) {
+                if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
                     debug!(
                         "Live: block range error, will retry with {}-{}",
                         retry.from, retry.to
@@ -432,7 +432,7 @@ async fn run_block_historical(
                 let err_str = format!("{e:#}");
 
                 if let Some(retry) =
-                    retry_with_block_range(&err_str, from_block, to_block, max_block_range)
+                    retry_logs_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
                     if retry.backoff {
                         warn!(
@@ -541,7 +541,7 @@ async fn run_block_live(
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
-                if let Some(retry) = retry_with_block_range(&err_str, from_block, to_block, None) {
+                if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
                     debug!(
                         "Live: block range error, will retry with {}-{}",
                         retry.from, retry.to
@@ -677,7 +677,7 @@ async fn run_trace_historical(
                 let err_str = format!("{e:#}");
 
                 if let Some(retry) =
-                    retry_with_block_range(&err_str, from_block, to_block, max_block_range)
+                    retry_logs_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
                     if retry.backoff {
                         warn!(
@@ -768,7 +768,7 @@ async fn run_trace_live(
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
-                if let Some(retry) = retry_with_block_range(&err_str, from_block, to_block, None) {
+                if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
                     debug!(
                         "Live: trace range error, will retry with {}-{}",
                         retry.from, retry.to
