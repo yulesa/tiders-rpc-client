@@ -27,7 +27,7 @@ use crate::query::{
 };
 use crate::response::ArrowResponse;
 
-use super::block_fetcher::fetch_blocks_with_retry;
+use super::block_fetcher::{fetch_blocks_with_retry, DEFAULT_RPC_BATCH_SIZE};
 use super::log_fetcher::fetch_logs_with_retry;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces_with_retry;
@@ -75,12 +75,15 @@ async fn run_coordinated_stream(
             .context("failed to get current block number for snapshot_latest_block")?,
     };
 
+    let rpc_batch_size = config.rpc_batch_size.unwrap_or(DEFAULT_RPC_BATCH_SIZE);
+
     let next_block = run_coordinated_historical(
         &provider,
         &query,
         pipelines,
         from_block,
         snapshot_latest_block,
+        rpc_batch_size,
         config.batch_size.map(|b| b as u64),
         config.retry_backoff_ms,
         &tx,
@@ -108,6 +111,7 @@ async fn run_coordinated_historical(
     pipelines: Pipelines,
     start_from: u64,
     snapshot_latest_block: u64,
+    rpc_batch_size: usize,
     initial_max_block_range: Option<u64>,
     retry_backoff_ms: u64,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
@@ -119,7 +123,7 @@ async fn run_coordinated_historical(
 
         debug!("Coordinated fetch for blocks {from_block}..{to_block}");
 
-        let response = fetch_all(provider, query, pipelines, from_block, to_block, initial_max_block_range, retry_backoff_ms).await?;
+        let response = fetch_all(provider, query, pipelines, from_block, to_block, rpc_batch_size, initial_max_block_range, retry_backoff_ms).await?;
 
         info!(
             "Coordinated batch: {} blocks ({from_block}-{to_block}), \
@@ -175,7 +179,8 @@ async fn run_coordinated_live(
 
         let to_block = safe_head;
 
-        let response = fetch_all(provider, query, pipelines, from_block, to_block, None, config.retry_backoff_ms).await?;
+        let rpc_batch_size = config.rpc_batch_size.unwrap_or(DEFAULT_RPC_BATCH_SIZE);
+        let response = fetch_all(provider, query, pipelines, from_block, to_block, rpc_batch_size, None, config.retry_backoff_ms).await?;
 
         let has_data = response.blocks.num_rows() > 0
             || response.transactions.num_rows() > 0
@@ -213,6 +218,7 @@ async fn fetch_all(
     pipelines: Pipelines,
     from_block: u64,
     to_block: u64,
+    rpc_batch_size: usize,
     max_block_range: Option<u64>,
     retry_backoff_ms: u64,
 ) -> Result<ArrowResponse> {
@@ -224,7 +230,7 @@ async fn fetch_all(
         let tx_fields = &query.fields.transaction;
 
         let blocks =
-            fetch_blocks_with_retry(provider, from_block, to_block, include_txs, max_block_range, retry_backoff_ms)
+            fetch_blocks_with_retry(provider, from_block, to_block, include_txs, rpc_batch_size, max_block_range, retry_backoff_ms)
                 .await?;
         let blocks_batch = select_block_columns(blocks_to_record_batch(&blocks), block_fields);
         let raw_txs_batch = transactions_to_record_batch(&blocks);

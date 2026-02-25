@@ -24,7 +24,7 @@ use crate::query::{
 };
 use crate::response::ArrowResponse;
 
-use super::block_fetcher::fetch_blocks;
+use super::block_fetcher::{fetch_blocks, DEFAULT_RPC_BATCH_SIZE};
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces;
@@ -319,6 +319,7 @@ async fn run_block_stream(
     let fetch_receipts_flag = needs_tx_receipts(&query);
     let block_fields = query.fields.block;
     let tx_fields = query.fields.transaction;
+    let rpc_batch_size = config.rpc_batch_size.unwrap_or(DEFAULT_RPC_BATCH_SIZE);
 
     let next_block = run_block_historical(
         &provider,
@@ -328,6 +329,7 @@ async fn run_block_stream(
         &tx_fields,
         from_block,
         snapshot_latest_block,
+        rpc_batch_size,
         config.batch_size.map(|b| b as u64),
         config.retry_backoff_ms,
         &tx,
@@ -363,6 +365,7 @@ async fn run_block_historical(
     tx_fields: &TransactionFields,
     start_from: u64,
     snapshot_latest_block: u64,
+    rpc_batch_size: usize,
     initial_max_block_range: Option<u64>,
     retry_backoff_ms: u64,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
@@ -376,7 +379,7 @@ async fn run_block_historical(
 
         debug!("Fetching blocks {from_block}..{to_block}");
 
-        match fetch_blocks(provider, from_block, to_block, include_txs).await {
+        match fetch_blocks(provider, from_block, to_block, include_txs, rpc_batch_size).await {
             Ok(blocks) => {
                 let num_blocks = blocks.len();
 
@@ -501,7 +504,8 @@ async fn run_block_live(
 
         let to_block = safe_head;
 
-        match fetch_blocks(provider, from_block, to_block, include_txs).await {
+        let rpc_batch_size = config.rpc_batch_size.unwrap_or(DEFAULT_RPC_BATCH_SIZE);
+        match fetch_blocks(provider, from_block, to_block, include_txs, rpc_batch_size).await {
             Ok(blocks) => {
                 let blocks_batch =
                     select_block_columns(blocks_to_record_batch(&blocks), block_fields);

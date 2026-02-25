@@ -2,7 +2,6 @@
 //!
 //! Adapted from rindexer's `create_client()` pattern (provider.rs:707-796).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::{
@@ -28,16 +27,13 @@ use alloy::{
     },
 };
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::config::ClientConfig;
 use crate::query::TraceMethod;
-
-use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
 
 /// The concrete alloy provider type with default fillers.
 type AlloyProvider = FillProvider<
@@ -49,9 +45,6 @@ type AlloyProvider = FillProvider<
     AnyNetwork,
 >;
 
-/// Default JSON-RPC batch size for `eth_getBlockByNumber` calls.
-const DEFAULT_RPC_BATCH_SIZE: usize = 50;
-
 /// A thin wrapper around an alloy provider.
 #[derive(Debug, Clone)]
 pub struct RpcProvider {
@@ -59,8 +52,6 @@ pub struct RpcProvider {
     /// The underlying `RpcClient` — needed for JSON-RPC batch calls which
     /// bypass the higher-level `Provider` trait.
     pub rpc_client: RpcClient,
-    /// JSON-RPC block range batch size.
-    pub rpc_batch_size: usize,
     /// Per-request timeout applied to `rpc_client` calls that bypass the
     /// reqwest transport timeout (batch sends, direct `request()` calls).
     pub req_timeout_millis: u64,
@@ -115,12 +106,9 @@ impl RpcProvider {
             .network::<AnyNetwork>()
             .connect_client(rpc_client.clone());
 
-        let rpc_batch_size = config.rpc_batch_size.unwrap_or(DEFAULT_RPC_BATCH_SIZE);
-
         Ok(Self {
             provider,
             rpc_client,
-            rpc_batch_size,
             req_timeout_millis: config.req_timeout_millis,
         })
     }
@@ -135,12 +123,14 @@ impl RpcProvider {
         Ok(number)
     }
 
-    /// Fetch blocks by number in batched JSON-RPC calls.
+    /// Adds multiple block numbers to call object and 
+    /// send a single JSON-RPC `eth_getBlockByNumber` call for the
+    /// given batch and return the results.
     ///
-    /// Adapted from rindexer's `get_block_by_number_batch_with_size()`
-    /// (provider.rs:440-506). Deduplicates block numbers, chunks into
-    /// sub-batches of `rpc_batch_size`, and executes with bounded concurrency.
-    pub async fn get_blocks_by_number(
+    /// This is the low-level RPC primitive — it does **not** deduplicate,
+    /// chunk, or manage concurrency. Callers (i.e. `block_fetcher`) are
+    /// responsible for orchestration.
+    pub async fn get_block_batch(
         &self,
         block_numbers: &[u64],
         include_txs: bool,
@@ -149,94 +139,43 @@ impl RpcProvider {
             return Ok(Vec::new());
         }
 
-        // Deduplicate while preserving order.
-        let mut seen = std::collections::HashSet::new();
-        let deduped: Vec<u64> = block_numbers
-            .iter()
-            .copied()
-            .filter(|n| seen.insert(*n))
-            .collect();
+        let mut batch = self.rpc_client.new_batch();
+        let mut request_futures = Vec::with_capacity(block_numbers.len());
 
-        let semaphore = Arc::new(Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
-
-        let req_timeout_millis = self.req_timeout_millis;
-
-        let futures: Vec<_> = deduped
-            .chunks(self.rpc_batch_size)
-            .map(|chunk| {
-                let client = self.rpc_client.clone();
-                let owned_chunk = chunk.to_vec();
-                let sem = semaphore.clone();
-
-                tokio::spawn(async move {
-                    let _permit = sem
-                        .acquire_owned()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
-
-                    ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-
-                    info!(
-                        "get_blocks_by_number: sending sub-batch of {} blocks ({}-{})",
-                        owned_chunk.len(),
-                        owned_chunk.first().copied().unwrap_or(0),
-                        owned_chunk.last().copied().unwrap_or(0),
-                    );
-
-                    let mut batch = client.new_batch();
-                    let mut request_futures = Vec::with_capacity(owned_chunk.len());
-
-                    for block_num in &owned_chunk {
-                        let params = (BlockNumberOrTag::Number(*block_num), include_txs);
-                        let call = batch
-                            .add_call("eth_getBlockByNumber", &params)
-                            .map_err(|e| anyhow::anyhow!("failed to add batch call: {e}"))?;
-                        request_futures.push(call);
-                    }
-
-                    let timeout = Duration::from_millis(req_timeout_millis);
-                    match tokio::time::timeout(timeout, batch.send()).await {
-                        Err(_) => {
-                            report_rpc_outcome(&Err("request timed out"));
-                            return Err(anyhow::anyhow!(
-                                "eth_getBlockByNumber batch timed out after {req_timeout_millis}ms"
-                            ));
-                        }
-                        Ok(Err(e)) => {
-                            let err_str = e.to_string();
-                            report_rpc_outcome(&Err(&err_str));
-                            return Err(anyhow::anyhow!(
-                                "eth_getBlockByNumber batch failed: {e}"
-                            ));
-                        }
-                        Ok(Ok(())) => {
-                            report_rpc_outcome(&Ok(()));
-                        }
-                    }
-
-                    let mut results: Vec<Option<AnyRpcBlock>> =
-                        Vec::with_capacity(request_futures.len());
-                    for f in request_futures {
-                        let block = f
-                            .await
-                            .map_err(|e| anyhow::anyhow!("batch response error: {e}"))?;
-                        results.push(block);
-                    }
-
-                    Ok::<Vec<AnyRpcBlock>, anyhow::Error>(results.into_iter().flatten().collect())
-                })
-            })
-            .collect();
-
-        let mut all_blocks = Vec::new();
-        for handle in futures {
-            let blocks = handle
-                .await
-                .map_err(|e| anyhow::anyhow!("block batch task panicked: {e}"))??;
-            all_blocks.extend(blocks);
+        for block_num in block_numbers {
+            let params = (BlockNumberOrTag::Number(*block_num), include_txs);
+            let call = batch
+                .add_call("eth_getBlockByNumber", &params)
+                .map_err(|e| anyhow::anyhow!("failed to add batch call: {e}"))?;
+            request_futures.push(call);
         }
 
-        Ok(all_blocks)
+        let timeout = Duration::from_millis(self.req_timeout_millis);
+        let req_timeout_millis = self.req_timeout_millis;
+        match tokio::time::timeout(timeout, batch.send()).await {
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "eth_getBlockByNumber batch timed out after {req_timeout_millis}ms"
+                ));
+            }
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "eth_getBlockByNumber batch failed: {e}"
+                ));
+            }
+            Ok(Ok(())) => {}
+        }
+
+        let mut results: Vec<Option<AnyRpcBlock>> =
+            Vec::with_capacity(request_futures.len());
+        for f in request_futures {
+            let block = f
+                .await
+                .map_err(|e| anyhow::anyhow!("batch response error: {e}"))?;
+            results.push(block);
+        }
+
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Fetch traces for a single block, dispatching to `trace_block` or
