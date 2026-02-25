@@ -37,6 +37,8 @@ use url::Url;
 use crate::config::ClientConfig;
 use crate::query::TraceMethod;
 
+use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
+
 /// The concrete alloy provider type with default fillers.
 type AlloyProvider = FillProvider<
     JoinFill<
@@ -49,9 +51,6 @@ type AlloyProvider = FillProvider<
 
 /// Default JSON-RPC batch size for `eth_getBlockByNumber` calls.
 const DEFAULT_RPC_BATCH_SIZE: usize = 50;
-
-/// Maximum concurrent sub-batches within a single batch block request.
-const MAX_CONCURRENT_SUB_BATCHES: usize = 2;
 
 /// A thin wrapper around an alloy provider.
 #[derive(Debug, Clone)]
@@ -158,7 +157,7 @@ impl RpcProvider {
             .filter(|n| seen.insert(*n))
             .collect();
 
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SUB_BATCHES));
+        let semaphore = Arc::new(Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
 
         let req_timeout_millis = self.req_timeout_millis;
 
@@ -174,6 +173,8 @@ impl RpcProvider {
                         .acquire_owned()
                         .await
                         .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
+
+                    ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
 
                     info!(
                         "get_blocks_by_number: sending sub-batch of {} blocks ({}-{})",
@@ -196,16 +197,21 @@ impl RpcProvider {
                     let timeout = Duration::from_millis(req_timeout_millis);
                     match tokio::time::timeout(timeout, batch.send()).await {
                         Err(_) => {
+                            report_rpc_outcome(&Err("request timed out"));
                             return Err(anyhow::anyhow!(
                                 "eth_getBlockByNumber batch timed out after {req_timeout_millis}ms"
                             ));
                         }
                         Ok(Err(e)) => {
+                            let err_str = e.to_string();
+                            report_rpc_outcome(&Err(&err_str));
                             return Err(anyhow::anyhow!(
                                 "eth_getBlockByNumber batch failed: {e}"
                             ));
                         }
-                        Ok(Ok(())) => {}
+                        Ok(Ok(())) => {
+                            report_rpc_outcome(&Ok(()));
+                        }
                     }
 
                     let mut results: Vec<Option<AnyRpcBlock>> =

@@ -1,3 +1,4 @@
+pub(crate) mod adaptive_concurrency;
 pub(crate) mod block_fetcher;
 mod log_fetcher;
 mod multi_pipeline_stream;

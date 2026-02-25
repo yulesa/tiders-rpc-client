@@ -18,10 +18,8 @@ use tokio::sync::Semaphore;
 use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_with_block_range};
 use crate::query::TraceMethod;
 
+use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
 use super::provider::RpcProvider;
-
-/// Maximum concurrent trace calls per block.
-const MAX_CONCURRENT_TRACE_CALLS: usize = 4;
 
 /// Fetch all traces for a contiguous range of blocks.
 ///
@@ -47,7 +45,7 @@ pub async fn fetch_traces(
          via {trace_method:?}"
     );
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TRACE_CALLS));
+    let semaphore = Arc::new(Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
 
     let handles: Vec<_> = block_numbers
         .into_iter()
@@ -60,10 +58,22 @@ pub async fn fetch_traces(
                     .await
                     .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-                provider
+                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+
+                let result = provider
                     .get_block_traces(block_num, trace_method)
                     .await
-                    .with_context(|| format!("trace fetch for block {block_num}"))
+                    .with_context(|| format!("trace fetch for block {block_num}"));
+
+                match &result {
+                    Ok(_) => report_rpc_outcome(&Ok(())),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        report_rpc_outcome(&Err(&err_str));
+                    }
+                }
+
+                result
             })
         })
         .collect();

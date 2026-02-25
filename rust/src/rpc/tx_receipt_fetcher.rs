@@ -18,10 +18,8 @@ use tokio::sync::Semaphore;
 
 use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_with_block_range};
 
+use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
 use super::provider::RpcProvider;
-
-/// Maximum concurrent `eth_getBlockReceipts` calls.
-const MAX_CONCURRENT_TX_RECEIPT_CALLS: usize = 4;
 
 /// Fetch all tx receipts for a contiguous range of blocks.
 ///
@@ -48,7 +46,7 @@ pub async fn fetch_tx_receipts(
         "fetch_tx_receipts: requesting tx receipts for {count} blocks ({from_block}..={to_block})"
     );
 
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_TX_RECEIPT_CALLS));
+    let semaphore = Arc::new(Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
 
     let handles: Vec<_> = block_numbers
         .into_iter()
@@ -61,10 +59,22 @@ pub async fn fetch_tx_receipts(
                     .await
                     .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-                provider
+                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+
+                let result = provider
                     .get_block_receipts(block_num)
                     .await
-                    .with_context(|| format!("eth_getBlockReceipts for block {block_num}"))
+                    .with_context(|| format!("eth_getBlockReceipts for block {block_num}"));
+
+                match &result {
+                    Ok(_) => report_rpc_outcome(&Ok(())),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        report_rpc_outcome(&Err(&err_str));
+                    }
+                }
+
+                result
             })
         })
         .collect();
