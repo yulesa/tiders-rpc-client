@@ -28,7 +28,7 @@ use alloy::{
     },
 };
 use anyhow::{Context, Result};
-use log::{error, info, warn};
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Semaphore;
@@ -60,8 +60,11 @@ pub struct RpcProvider {
     /// The underlying `RpcClient` — needed for JSON-RPC batch calls which
     /// bypass the higher-level `Provider` trait.
     pub rpc_client: RpcClient,
-    /// JSON-RPC batch size for block/receipt batch requests.
+    /// JSON-RPC block range batch size.
     pub rpc_batch_size: usize,
+    /// Per-request timeout applied to `rpc_client` calls that bypass the
+    /// reqwest transport timeout (batch sends, direct `request()` calls).
+    pub req_timeout_millis: u64,
 }
 
 impl RpcProvider {
@@ -119,6 +122,7 @@ impl RpcProvider {
             provider,
             rpc_client,
             rpc_batch_size,
+            req_timeout_millis: config.req_timeout_millis,
         })
     }
 
@@ -156,6 +160,8 @@ impl RpcProvider {
 
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SUB_BATCHES));
 
+        let req_timeout_millis = self.req_timeout_millis;
+
         let futures: Vec<_> = deduped
             .chunks(self.rpc_batch_size)
             .map(|chunk| {
@@ -187,12 +193,19 @@ impl RpcProvider {
                         request_futures.push(call);
                     }
 
-                    if let Err(e) = batch.send().await {
-                        error!(
-                            "Failed to send batch eth_getBlockByNumber ({} blocks): {e:?}",
-                            request_futures.len()
-                        );
-                        return Err(anyhow::anyhow!("batch send failed: {e}"));
+                    let timeout = Duration::from_millis(req_timeout_millis);
+                    match tokio::time::timeout(timeout, batch.send()).await {
+                        Err(_) => {
+                            return Err(anyhow::anyhow!(
+                                "eth_getBlockByNumber batch timed out after {req_timeout_millis}ms"
+                            ));
+                        }
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!(
+                                "eth_getBlockByNumber batch failed: {e}"
+                            ));
+                        }
+                        Ok(Ok(())) => {}
                     }
 
                     let mut results: Vec<Option<AnyRpcBlock>> =
@@ -286,35 +299,43 @@ impl RpcProvider {
         let block = json!(format!("0x{block_number:x}"));
         let options = json!({ "tracer": "callTracer", "tracerConfig": { "onlyTopCall": false } });
 
-        let raw_frames: Vec<TraceCallFrame> = self
-            .rpc_client
-            .request("debug_traceBlockByNumber", (block, options))
-            .await
-            .map_err(|e| {
-                let msg = format!("{e}");
-                if msg.contains("Method not found")
-                    || msg.contains("method not found")
-                    || msg.contains("debug_traceBlockByNumber")
-                    || msg.contains("not supported")
-                    || msg.contains("unsupported")
-                {
-                    anyhow::anyhow!(
-                        "debug_traceBlockByNumber is not supported by this RPC provider.\n\
-                         Fetching traces per transaction (debug_traceTransaction) is deliberately \
-                         not implemented because it requires one HTTP request per transaction. \
-                         Either switch to a provider that supports debug_traceBlockByNumber \
-                         (Geth, Reth, Erigon, Alchemy, QuickNode, Infura) or configure \
-                         TraceMethod::TraceBlock if your provider supports it, \
-                         or use a cherry client that does not rely on RPC calls: \
-                           SQD Network, HyperSync\n\
-                         Original provider error: {msg}"
-                    )
-                } else {
-                    anyhow::anyhow!(
-                        "debug_traceBlockByNumber failed for block {block_number}: {msg}"
-                    )
-                }
-            })?;
+        let timeout = Duration::from_millis(self.req_timeout_millis);
+        let req_timeout_millis = self.req_timeout_millis;
+        let raw_frames: Vec<TraceCallFrame> = tokio::time::timeout(
+            timeout,
+            self.rpc_client.request("debug_traceBlockByNumber", (block, options)),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "debug_traceBlockByNumber for block {block_number} timed out after {req_timeout_millis}ms"
+            )
+        })?
+        .map_err(|e| {
+            let msg = format!("{e}");
+            if msg.contains("Method not found")
+                || msg.contains("method not found")
+                || msg.contains("debug_traceBlockByNumber")
+                || msg.contains("not supported")
+                || msg.contains("unsupported")
+            {
+                anyhow::anyhow!(
+                    "debug_traceBlockByNumber is not supported by this RPC provider.\n\
+                     Fetching traces per transaction (debug_traceTransaction) is deliberately \
+                     not implemented because it requires one HTTP request per transaction. \
+                     Either switch to a provider that supports debug_traceBlockByNumber \
+                     (Geth, Reth, Erigon, Alchemy, QuickNode, Infura) or configure \
+                     TraceMethod::TraceBlock if your provider supports it, \
+                     or use a cherry client that does not rely on RPC calls: \
+                       SQD Network, HyperSync\n\
+                     Original provider error: {msg}"
+                )
+            } else {
+                anyhow::anyhow!(
+                    "debug_traceBlockByNumber failed for block {block_number}: {msg}"
+                )
+            }
+        })?;
 
         // Flatten the nested call tree into a list of LocalizedTransactionTrace,
         // the same format that trace_block produces — so the rest of the pipeline is agnostic to which method was used.
@@ -398,32 +419,42 @@ impl RpcProvider {
         block_number: u64,
     ) -> Result<Vec<AnyTransactionReceipt>> {
         let params = (BlockNumberOrTag::Number(block_number),);
-        self.rpc_client
-            .request::<_, Option<Vec<AnyTransactionReceipt>>>("eth_getBlockReceipts", params)
-            .await
-            .map_err(|e| {
-                let msg = format!("{e}");
-                if msg.contains("Method not found")
-                    || msg.contains("method not found")
-                    || msg.contains("eth_getBlockReceipts")
-                    || msg.contains("not supported")
-                    || msg.contains("unsupported")
-                {
-                    anyhow::anyhow!(
-                        "eth_getBlockReceipts is not supported by this RPC provider.\n\
-                         Fetching receipts one-by-one (eth_getTransactionReceipt) is deliberately \
-                         not implemented because it requires one HTTP request per transaction. \
-                         Switch to a provider that supports eth_getBlockReceipts \
-                         (Alchemy, QuickNode, Infura, Chainstack, dRPC, Moralis, GetBlock), \
-                         or use a cherry client that does not rely on RPC calls: \
-                           SQD Network, HyperSync\n\
-                         Original provider error: {msg}"
-                    )
-                } else {
-                    anyhow::anyhow!("eth_getBlockReceipts failed for block {block_number}: {msg}")
-                }
-            })
-            .map(|opt| opt.unwrap_or_default())
+        let timeout = Duration::from_millis(self.req_timeout_millis);
+        let req_timeout_millis = self.req_timeout_millis;
+        tokio::time::timeout(
+            timeout,
+            self.rpc_client
+                .request::<_, Option<Vec<AnyTransactionReceipt>>>("eth_getBlockReceipts", params),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "eth_getBlockReceipts for block {block_number} timed out after {req_timeout_millis}ms"
+            )
+        })?
+        .map_err(|e| {
+            let msg = format!("{e}");
+            if msg.contains("Method not found")
+                || msg.contains("method not found")
+                || msg.contains("eth_getBlockReceipts")
+                || msg.contains("not supported")
+                || msg.contains("unsupported")
+            {
+                anyhow::anyhow!(
+                    "eth_getBlockReceipts is not supported by this RPC provider.\n\
+                     Fetching receipts one-by-one (eth_getTransactionReceipt) is deliberately \
+                     not implemented because it requires one HTTP request per transaction. \
+                     Switch to a provider that supports eth_getBlockReceipts \
+                     (Alchemy, QuickNode, Infura, Chainstack, dRPC, Moralis, GetBlock), \
+                     or use a cherry client that does not rely on RPC calls: \
+                       SQD Network, HyperSync\n\
+                     Original provider error: {msg}"
+                )
+            } else {
+                anyhow::anyhow!("eth_getBlockReceipts failed for block {block_number}: {msg}")
+            }
+        })
+        .map(|opt| opt.unwrap_or_default())
     }
 }
 
