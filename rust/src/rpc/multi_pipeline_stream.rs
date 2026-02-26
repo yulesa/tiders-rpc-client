@@ -230,7 +230,7 @@ async fn fetch_all(
         let raw_txs_batch = transactions_to_record_batch(&blocks);
 
         let merged_txs = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-            let receipts = fetch_tx_receipts_with_retry(provider, from_block, to_block, None, retry_backoff_ms).await?;
+            let receipts = fetch_tx_receipts_with_retry(provider, from_block, to_block, None).await?;
             merge_tx_receipts_into_batch(raw_txs_batch, &receipts)
         } else {
             raw_txs_batch

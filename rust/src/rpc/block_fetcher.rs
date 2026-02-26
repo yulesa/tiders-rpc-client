@@ -11,9 +11,9 @@ use alloy::network::AnyRpcBlock;
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 
-use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_block_with_block_range};
+use crate::convert::clamp_to_block;
 
-use super::block_adaptive_concurrency::{report_block_rpc_outcome, BLOCK_ADAPTIVE_CONCURRENCY};
+use super::block_adaptive_concurrency::{halved_block_range, is_fatal_error, retry_block_with_block_range};
 use super::provider::RpcProvider;
 
 /// Default chunk size for `eth_getBlockByNumber` batch calls.
@@ -38,24 +38,12 @@ pub async fn fetch_blocks(
     let count = block_numbers.len();
     info!("fetch_blocks: requesting {count} blocks ({from_block}..={to_block})");
 
-    BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-
-    let result = provider
+    let blocks = provider
         .get_block_batch(&block_numbers, include_txs)
         .await
         .with_context(|| {
             format!("eth_getBlockByNumber batch for blocks {from_block}-{to_block}")
-        });
-
-    match &result {
-        Ok(_) => report_block_rpc_outcome(&Ok(())),
-        Err(e) => {
-            let err_str = e.to_string();
-            report_block_rpc_outcome(&Err(&err_str));
-        }
-    }
-
-    let blocks = result?;
+        })?;
 
     info!(
         "fetch_blocks: received {} blocks for range {from_block}..={to_block}",

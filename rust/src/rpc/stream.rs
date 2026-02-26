@@ -3,17 +3,22 @@
 //! Adapted from rindexer's `fetch_logs_stream()` (fetch_logs.rs:30-149) and
 //! `live_indexing_stream()` (fetch_logs.rs:391-711).
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ClientConfig;
 use crate::convert::{
-    blocks_to_record_batch, clamp_to_block, halved_block_range, is_fatal_error,
-    logs_to_record_batch, merge_tx_receipts_into_batch, retry_block_with_block_range,
+    blocks_to_record_batch, clamp_to_block,
+    logs_to_record_batch, merge_tx_receipts_into_batch,
     retry_logs_with_block_range, select_block_columns, select_log_columns,
     select_trace_columns, select_transaction_columns, traces_to_record_batch,
     transactions_to_record_batch,
@@ -24,6 +29,10 @@ use crate::query::{
 };
 use crate::response::ArrowResponse;
 
+use super::block_adaptive_concurrency::{
+    halved_block_range, is_fatal_error, is_rate_limit_error, retry_block_with_block_range,
+    BLOCK_ADAPTIVE_CONCURRENCY,
+};
 use super::block_fetcher::{fetch_blocks, DEFAULT_BLOCK_CHUNK_SIZE};
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
@@ -355,6 +364,11 @@ async fn run_block_stream(
 
 /// Historical phase for the block pipeline: iterate `[from_block, snapshot]`
 /// in chunks, fetch blocks (and optionally tx receipts), and send Arrow responses.
+///
+/// Spawns multiple concurrent fetch tasks via `JoinSet`, bounded by the block
+/// adaptive concurrency controller. Each task fetches a chunk of blocks,
+/// optionally fetches tx receipts, converts to Arrow, and returns the response.
+/// Results are sent to the channel as they complete (no ordering guarantee).
 async fn run_block_historical(
     provider: &RpcProvider,
     include_txs: bool,
@@ -369,104 +383,219 @@ async fn run_block_historical(
     let original_max_range = config
         .batch_size
         .map(|b| (b as u64).min(DEFAULT_BLOCK_CHUNK_SIZE as u64))
-        .or(Some(DEFAULT_BLOCK_CHUNK_SIZE as u64));
-    let retry_backoff_ms = config.retry_backoff_ms;
-    let mut max_block_range = original_max_range;
-    let mut from_block = start_from;
+        .unwrap_or(DEFAULT_BLOCK_CHUNK_SIZE as u64);
 
-    while from_block <= snapshot_latest_block {
-        let to_block = clamp_to_block(from_block, snapshot_latest_block, max_block_range);
+    // Shared chunk size — tasks can shrink it via fetch_min on errors.
+    let chunk_size = Arc::new(AtomicU64::new(original_max_range));
+    let cancel = CancellationToken::new();
+    let mut join_set: JoinSet<(u64, u64, Result<ArrowResponse>)> = JoinSet::new();
+    let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
 
-        debug!("Fetching blocks {from_block}..{to_block}");
+    // Next unassigned from_block.
+    let mut cursor = start_from;
 
-        match fetch_blocks(provider, from_block, to_block, include_txs).await {
-            Ok(blocks) => {
-                let num_blocks = blocks.len();
+    let block_fields = *block_fields;
+    let tx_fields = *tx_fields;
 
-                let blocks_batch = select_block_columns(blocks_to_record_batch(&blocks), block_fields);
-                let raw_txs_batch = transactions_to_record_batch(&blocks);
+    loop {
+        // Fill join_set up to the current concurrency limit.
+        let max_concurrent = BLOCK_ADAPTIVE_CONCURRENCY.current();
+        while join_set.len() < max_concurrent {
+            let (chunk_from, chunk_to) = if let Some((rf, rt)) = retry_queue.pop_front() {
+                // Priority: retry failed ranges first.
+                (rf, rt)
+            } else if cursor <= snapshot_latest_block {
+                // Claim next chunk from cursor.
+                let current_chunk = chunk_size.load(Ordering::Relaxed);
+                let from = cursor;
+                let to = (from + current_chunk - 1).min(snapshot_latest_block);
+                cursor = to + 1;
+                (from, to)
+            } else {
+                // No more work to assign.
+                break;
+            };
 
-                // Optionally fetch tx receipts and merge into the transactions batch.
-                let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-                    let tx_receipts = fetch_tx_receipts_with_retry(
-                        provider,
-                        from_block,
-                        to_block,
-                        max_block_range,
-                        retry_backoff_ms,
-                    )
-                    .await?;
-                    info!(
-                        "Fetched {} tx receipts for blocks {from_block}-{to_block}",
-                        tx_receipts.len()
-                    );
-                    merge_tx_receipts_into_batch(raw_txs_batch, &tx_receipts)
-                } else {
-                    raw_txs_batch
-                };
+            // Spawn a fetch task.
+            let task_provider = provider.clone();
+            let task_cancel = cancel.clone();
+            let task_chunk_size = Arc::clone(&chunk_size);
 
-                let txs_batch = select_transaction_columns(txs_batch, tx_fields);
+            join_set.spawn(async move {
+                if task_cancel.is_cancelled() {
+                    return (chunk_from, chunk_to, Err(anyhow::anyhow!("cancelled")));
+                }
 
-                info!(
-                    "Fetched {num_blocks} blocks between {from_block}-{to_block} \
-                     ({} block rows, {} tx rows)",
-                    blocks_batch.num_rows(),
-                    txs_batch.num_rows()
-                );
+                let result = run_block_fetch_task(
+                    &task_provider,
+                    chunk_from,
+                    chunk_to,
+                    include_txs,
+                    fetch_receipts_flag,
+                    &block_fields,
+                    &tx_fields,
+                    Some(task_chunk_size.load(Ordering::Relaxed)),
+                )
+                .await;
 
-                let response = ArrowResponse::with_blocks(blocks_batch, txs_batch);
+                (chunk_from, chunk_to, result)
+            });
+        }
+
+        // If no tasks in flight and nothing to assign, we're done.
+        if join_set.is_empty() {
+            break;
+        }
+
+        // Await next completion.
+        let Some(join_result) = join_set.join_next().await else {
+            break;
+        };
+
+        // Handle JoinError (task panic / cancellation).
+        let (chunk_from, chunk_to, task_result) = match join_result {
+            Ok(tuple) => tuple,
+            Err(join_err) => {
+                error!("Block fetch task panicked: {join_err}");
+                cancel.cancel();
+                // Drain remaining tasks.
+                while join_set.join_next().await.is_some() {}
+                return Err(anyhow::anyhow!("block fetch task panicked: {join_err}"));
+            }
+        };
+
+        match task_result {
+            Ok(response) => {
+                BLOCK_ADAPTIVE_CONCURRENCY.record_success();
 
                 if tx.send(Ok(response)).await.is_err() {
                     debug!("Stream consumer dropped, stopping historical block fetch");
-                    return Ok(from_block);
+                    cancel.cancel();
+                    while join_set.join_next().await.is_some() {}
+                    return Ok(cursor);
                 }
 
-                from_block = to_block + 1;
-
+                // 10% random chance to reset chunk_size to original.
                 let mut rng = rand::rng();
                 if rng.random_bool(0.10) {
-                    max_block_range = original_max_range;
+                    chunk_size.store(original_max_range, Ordering::Relaxed);
                 }
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
 
-                if let Some(retry) =
-                    retry_block_with_block_range(&err_str, from_block, to_block, max_block_range)
-                {
-                    if retry.backoff {
-                        warn!(
-                            "Block range error, retrying with {}-{} (was {from_block}-{to_block}), backing off {retry_backoff_ms}ms",
-                            retry.from, retry.to
-                        );
-                        tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
-                    } else {
-                        warn!(
-                            "Block range error, retrying with {}-{} (was {from_block}-{to_block})",
-                            retry.from, retry.to
-                        );
-                    }
-                    from_block = retry.from;
-                    max_block_range = retry.max_block_range;
-                    continue;
-                }
-
-                // Fatal errors are not recoverable — propagate immediately.
+                // 1. Fatal errors — cancel everything and return.
                 if is_fatal_error(&err_str) {
+                    cancel.cancel();
+                    while join_set.join_next().await.is_some() {}
                     return Err(e);
                 }
 
-                let halved = halved_block_range(from_block, to_block);
+                // Cancelled tasks — just drop them.
+                if cancel.is_cancelled() {
+                    continue;
+                }
+
+                // 2. Rate-limit errors — reduce concurrency and backoff, re-queue.
+                if is_rate_limit_error(&err_str) {
+                    BLOCK_ADAPTIVE_CONCURRENCY.record_rate_limit();
+                    BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                    retry_queue.push_back((chunk_from, chunk_to));
+                    continue;
+                }
+
+                // 3. Retryable block-range errors — shrink chunk only, no concurrency change.
+                let current_range = Some(chunk_size.load(Ordering::Relaxed));
+                if let Some(retry) =
+                    retry_block_with_block_range(&err_str, chunk_from, chunk_to, current_range)
+                {
+                    warn!(
+                        "Block range error, re-queuing {}-{} (was {chunk_from}-{chunk_to})",
+                        retry.from, retry.to
+                    );
+                    if let Some(new_max) = retry.max_block_range {
+                        chunk_size.fetch_min(new_max, Ordering::Relaxed);
+                    }
+                    if retry.backoff {
+                        BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                    }
+                    retry_queue.push_back((retry.from, retry.to));
+                    // If there's a remainder after the retried portion, re-queue that too.
+                    if retry.to < chunk_to {
+                        retry_queue.push_back((retry.to + 1, chunk_to));
+                    }
+                    continue;
+                }
+
+                // 4. Unknown error — reduce concurrency, halve range and re-queue.
+                BLOCK_ADAPTIVE_CONCURRENCY.record_error();
+                let halved = halved_block_range(chunk_from, chunk_to);
                 error!(
-                    "Unexpected error fetching blocks {from_block}-{to_block}, \
-                     retrying {from_block}-{halved}: {err_str}"
+                    "Unexpected error fetching blocks {chunk_from}-{chunk_to}, \
+                     re-queuing {chunk_from}-{halved}: {err_str}"
                 );
-                max_block_range = Some(halved.saturating_sub(from_block));
+                let new_range = halved.saturating_sub(chunk_from);
+                chunk_size.fetch_min(new_range, Ordering::Relaxed);
+                retry_queue.push_back((chunk_from, halved));
+                // If there's a remainder after the halved portion, re-queue that too.
+                if halved < chunk_to {
+                    retry_queue.push_back((halved + 1, chunk_to));
+                }
             }
         }
     }
 
-    Ok(from_block)
+    // Return cursor past the snapshot so the live phase starts correctly.
+    Ok(snapshot_latest_block + 1)
+}
+
+/// Single fetch task for blocks, transactions and receipts: fetch blocks,
+/// optionally fetch tx receipts, convert to Arrow.
+async fn run_block_fetch_task(
+    provider: &RpcProvider,
+    from_block: u64,
+    to_block: u64,
+    include_txs: bool,
+    fetch_receipts_flag: bool,
+    block_fields: &BlockFields,
+    tx_fields: &TransactionFields,
+    max_block_range: Option<u64>,
+) -> Result<ArrowResponse> {
+    BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+
+    let blocks = fetch_blocks(provider, from_block, to_block, include_txs).await?;
+    let num_blocks = blocks.len();
+
+    let blocks_batch = select_block_columns(blocks_to_record_batch(&blocks), block_fields);
+    let raw_txs_batch = transactions_to_record_batch(&blocks);
+
+    let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
+        let tx_receipts = fetch_tx_receipts_with_retry(
+            provider,
+            from_block,
+            to_block,
+            max_block_range,
+        )
+        .await?;
+        info!(
+            "Fetched {} tx receipts for blocks {from_block}-{to_block}",
+            tx_receipts.len()
+        );
+        merge_tx_receipts_into_batch(raw_txs_batch, &tx_receipts)
+    } else {
+        raw_txs_batch
+    };
+
+    let txs_batch = select_transaction_columns(txs_batch, tx_fields);
+
+    info!(
+        "Fetched {num_blocks} blocks between {from_block}-{to_block} \
+         ({} block rows, {} tx rows)",
+        blocks_batch.num_rows(),
+        txs_batch.num_rows()
+    );
+
+    Ok(ArrowResponse::with_blocks(blocks_batch, txs_batch))
 }
 
 /// Live phase for the block pipeline: poll for new blocks.
@@ -512,7 +641,7 @@ async fn run_block_live(
 
                 let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
                     let tx_receipts =
-                        fetch_tx_receipts_with_retry(provider, from_block, to_block, None, config.retry_backoff_ms).await?;
+                        fetch_tx_receipts_with_retry(provider, from_block, to_block, None).await?;
                     merge_tx_receipts_into_batch(raw_txs_batch, &tx_receipts)
                 } else {
                     raw_txs_batch

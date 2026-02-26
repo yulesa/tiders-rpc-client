@@ -181,43 +181,6 @@ pub fn retry_logs_with_block_range(
     None
 }
 
-/// Attempt to parse an RPC error from a block-fetching call and suggest a
-/// smaller block range.
-///
-/// Unlike [`retry_logs_with_block_range`], this is kept minimal — provider-
-/// specific patterns will be added as they are discovered.
-///
-/// Returns `None` if the error is not recoverable by reducing the range.
-pub fn retry_block_with_block_range(
-    error_message: &str,
-    from_block: u64,
-    to_block: u64,
-    max_block_range: Option<u64>,
-) -> Option<RetryBlockRange> {
-    warn!("Attempt to parse an RPC block-batch error (blocks {from_block}-{to_block}): {error_message}");
-    let error_lower = truncate_and_lowercase(error_message, 5000);
-
-    if is_fatal_error_lower(&error_lower) {
-        return None;
-    }
-
-    // Fallback: halve the range.
-    if to_block > from_block {
-        let halved = halved_block_range(from_block, to_block);
-        let range = halved.saturating_sub(from_block);
-        let suggested = pick_min_range(max_block_range, range);
-
-        return Some(RetryBlockRange {
-            from: from_block,
-            to: from_block + suggested,
-            max_block_range: Some(suggested),
-            backoff: false,
-        });
-    }
-
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

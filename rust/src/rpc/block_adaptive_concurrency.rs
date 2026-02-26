@@ -10,10 +10,8 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use log::info;
+use log::{info, warn};
 use once_cell::sync::Lazy;
-
-use super::adaptive_concurrency::is_rate_limit_error;
 
 /// Global adaptive concurrency controller for block pipeline batch calls.
 pub static BLOCK_ADAPTIVE_CONCURRENCY: Lazy<BlockAdaptiveConcurrency> = Lazy::new(|| {
@@ -151,20 +149,108 @@ impl BlockAdaptiveConcurrency {
     }
 }
 
-/// Report an RPC outcome to the block adaptive concurrency controller.
+// ===========================================================================
+// Error classification
+// ===========================================================================
+
+/// Returns `true` if the error string indicates a rate-limit response.
+pub fn is_rate_limit_error(err_str: &str) -> bool {
+    let lower = err_str.to_lowercase();
+    lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
+        || lower.contains("request limit")
+        || lower.contains("throttle")
+}
+
+/// Return `true` if the error is fatal and cannot be resolved by changing the
+/// block range or retrying.
+pub fn is_fatal_error(err_str: &str) -> bool {
+    is_fatal_error_lower(&truncate_and_lowercase(err_str, 5000))
+}
+
+fn is_fatal_error_lower(error_lower: &str) -> bool {
+    error_lower.contains("connection refused")
+        || error_lower.contains("no such host")
+        || error_lower.contains("failed to lookup")
+        || error_lower.contains("api key is not allowed")
+        || error_lower.contains("not allowed to access method")
+        || error_lower.contains("unauthorized")
+        || error_lower.contains("authentication failed")
+        || error_lower.contains("invalid api key")
+        || error_lower.contains("access denied")
+        || error_lower.contains("403 forbidden")
+        || error_lower.contains("method not supported")
+        || error_lower.contains("method not found")
+        || error_lower.contains("not supported by this provider")
+}
+
+// ===========================================================================
+// Block range retry
+// ===========================================================================
+
+/// Result of attempting to parse an error for a suggested block range.
+#[derive(Debug)]
+pub struct RetryBlockRange {
+    pub from: u64,
+    pub to: u64,
+    /// If set, this should become the new `max_block_range` for subsequent
+    /// requests.
+    pub max_block_range: Option<u64>,
+    /// If true, the caller should wait briefly before retrying (transient
+    /// network overload rather than a block-range limit).
+    pub backoff: bool,
+}
+
+/// Attempt to parse an RPC error from a block-fetching call and suggest a
+/// smaller block range.
 ///
-/// Call this after every block batch RPC call to feed success/error signals.
-pub fn report_block_rpc_outcome(result: &Result<(), &str>) {
-    match result {
-        Ok(()) => BLOCK_ADAPTIVE_CONCURRENCY.record_success(),
-        Err(err_str) => {
-            if is_rate_limit_error(err_str) {
-                BLOCK_ADAPTIVE_CONCURRENCY.record_rate_limit();
-            } else {
-                BLOCK_ADAPTIVE_CONCURRENCY.record_error();
-            }
-        }
+/// Returns `None` if the error is not recoverable by reducing the range
+/// (i.e. fatal errors).
+pub fn retry_block_with_block_range(
+    error_message: &str,
+    from_block: u64,
+    to_block: u64,
+    max_block_range: Option<u64>,
+) -> Option<RetryBlockRange> {
+    warn!("Attempt to parse an RPC block-batch error (blocks {from_block}-{to_block}): {error_message}");
+    let error_lower = truncate_and_lowercase(error_message, 5000);
+
+    if is_fatal_error_lower(&error_lower) {
+        return None;
     }
+
+    // Fallback: halve the range.
+    if to_block > from_block {
+        let halved = halved_block_range(from_block, to_block);
+        let range = halved.saturating_sub(from_block);
+        let suggested = pick_min_range(max_block_range, range);
+
+        return Some(RetryBlockRange {
+            from: from_block,
+            to: from_block + suggested,
+            max_block_range: Some(suggested),
+            backoff: false,
+        });
+    }
+
+    None
+}
+
+/// Take either the halved block range, or at least advance by 2 blocks.
+pub fn halved_block_range(from_block: u64, to_block: u64) -> u64 {
+    let range = to_block.saturating_sub(from_block);
+    let halved = from_block + range / 2;
+    halved.max(from_block + 2)
+}
+
+fn truncate_and_lowercase(s: &str, max_len: usize) -> String {
+    s.chars().take(max_len).collect::<String>().to_lowercase()
+}
+
+fn pick_min_range(max_block_range: Option<u64>, suggested: u64) -> u64 {
+    max_block_range.map_or(suggested, |orig| orig.min(suggested))
 }
 
 #[cfg(test)]
