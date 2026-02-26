@@ -633,33 +633,19 @@ async fn run_block_live(
 
         let to_block = safe_head;
 
-        match fetch_blocks(provider, from_block, to_block, include_txs).await {
-            Ok(blocks) => {
-                let blocks_batch =
-                    select_block_columns(blocks_to_record_batch(&blocks), block_fields);
-                let raw_txs_batch = transactions_to_record_batch(&blocks);
-
-                let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-                    let tx_receipts =
-                        fetch_tx_receipts_with_retry(provider, from_block, to_block, None).await?;
-                    merge_tx_receipts_into_batch(raw_txs_batch, &tx_receipts)
-                } else {
-                    raw_txs_batch
-                };
-
-                let txs_batch = select_transaction_columns(txs_batch, tx_fields);
-
-                if blocks_batch.num_rows() > 0 || txs_batch.num_rows() > 0 {
-                    info!(
-                        "Live: fetched blocks {from_block}-{to_block} \
-                         ({} block rows, {} tx rows)",
-                        blocks_batch.num_rows(),
-                        txs_batch.num_rows()
-                    );
-                }
-
-                let response = ArrowResponse::with_blocks(blocks_batch, txs_batch);
-
+        match run_block_fetch_task(
+            provider,
+            from_block,
+            to_block,
+            include_txs,
+            fetch_receipts_flag,
+            block_fields,
+            tx_fields,
+            None,
+        )
+        .await
+        {
+            Ok(response) => {
                 if tx.send(Ok(response)).await.is_err() {
                     debug!("Stream consumer dropped, stopping live block polling");
                     return Ok(());
@@ -669,18 +655,31 @@ async fn run_block_live(
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
-                if let Some(retry) = retry_block_with_block_range(&err_str, from_block, to_block, None) {
+
+                if is_fatal_error(&err_str) {
+                    return Err(e);
+                }
+
+                if is_rate_limit_error(&err_str) {
+                    BLOCK_ADAPTIVE_CONCURRENCY.record_rate_limit();
+                    BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                    continue;
+                }
+
+                if let Some(retry) =
+                    retry_block_with_block_range(&err_str, from_block, to_block, None)
+                {
                     debug!(
                         "Live: block range error, will retry with {}-{}",
                         retry.from, retry.to
                     );
+                    // Don't advance — the next iteration will retry naturally.
                 } else {
                     error!(
                         "Live: unexpected error fetching blocks {from_block}-{to_block}: {err_str}, retrying in {}ms",
                         config.retry_backoff_ms
                     );
                 }
-                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
             }
         }
     }

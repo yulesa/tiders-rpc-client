@@ -27,7 +27,7 @@ use crate::query::{
 };
 use crate::response::ArrowResponse;
 
-use super::block_fetcher::fetch_blocks_with_retry;
+use super::block_fetcher::fetch_blocks_concurrent;
 use super::log_fetcher::fetch_logs_with_retry;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces_with_retry;
@@ -224,8 +224,7 @@ async fn fetch_all(
         let tx_fields = &query.fields.transaction;
 
         let blocks =
-            fetch_blocks_with_retry(provider, from_block, to_block, include_txs, retry_backoff_ms)
-                .await?;
+            fetch_blocks_concurrent(provider, from_block, to_block, include_txs).await?;
         let blocks_batch = select_block_columns(blocks_to_record_batch(&blocks), block_fields);
         let raw_txs_batch = transactions_to_record_batch(&blocks);
 
