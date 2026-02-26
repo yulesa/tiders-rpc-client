@@ -13,7 +13,7 @@ use log::{error, info, warn};
 
 use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_block_with_block_range};
 
-use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
+use super::block_adaptive_concurrency::{report_block_rpc_outcome, BLOCK_ADAPTIVE_CONCURRENCY};
 use super::provider::RpcProvider;
 
 /// Default chunk size for `eth_getBlockByNumber` batch calls.
@@ -38,7 +38,7 @@ pub async fn fetch_blocks(
     let count = block_numbers.len();
     info!("fetch_blocks: requesting {count} blocks ({from_block}..={to_block})");
 
-    ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+    BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
 
     let result = provider
         .get_block_batch(&block_numbers, include_txs)
@@ -48,10 +48,10 @@ pub async fn fetch_blocks(
         });
 
     match &result {
-        Ok(_) => report_rpc_outcome(&Ok(())),
+        Ok(_) => report_block_rpc_outcome(&Ok(())),
         Err(e) => {
             let err_str = e.to_string();
-            report_rpc_outcome(&Err(&err_str));
+            report_block_rpc_outcome(&Err(&err_str));
         }
     }
 
