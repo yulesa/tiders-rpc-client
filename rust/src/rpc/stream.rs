@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 use crate::config::ClientConfig;
 use crate::convert::{
     blocks_to_record_batch, clamp_to_block, halved_block_range, is_fatal_error,
-    logs_to_record_batch, merge_tx_receipts_into_batch, retry_logs_with_block_range,
-    select_block_columns, select_log_columns,
+    logs_to_record_batch, merge_tx_receipts_into_batch, retry_block_with_block_range,
+    retry_logs_with_block_range, select_block_columns, select_log_columns,
     select_trace_columns, select_transaction_columns, traces_to_record_batch,
     transactions_to_record_batch,
 };
@@ -24,7 +24,7 @@ use crate::query::{
 };
 use crate::response::ArrowResponse;
 
-use super::block_fetcher::{fetch_blocks, DEFAULT_RPC_BATCH_SIZE};
+use super::block_fetcher::{fetch_blocks, DEFAULT_BLOCK_CHUNK_SIZE};
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces;
@@ -81,8 +81,7 @@ async fn run_log_stream(
         from_block,
         snapshot_latest_block,
         query.fields.log,
-        config.batch_size.map(|b| b as u64),
-        config.retry_backoff_ms,
+        &config,
         &tx,
     )
     .await?;
@@ -113,11 +112,14 @@ async fn run_log_historical(
     start_from: u64,
     snapshot_latest_block: u64,
     log_fields: LogFields,
-    initial_max_block_range: Option<u64>,
-    retry_backoff_ms: u64,
+    config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
-    let original_max_range = initial_max_block_range;
+    let original_max_range = config
+        .batch_size
+        .map(|b| (b as u64).min(DEFAULT_BLOCK_CHUNK_SIZE as u64))
+        .or(Some(DEFAULT_BLOCK_CHUNK_SIZE as u64));
+    let retry_backoff_ms = config.retry_backoff_ms;
     let mut max_block_range = original_max_range;
     let mut from_block = start_from;
 
@@ -319,8 +321,6 @@ async fn run_block_stream(
     let fetch_receipts_flag = needs_tx_receipts(&query);
     let block_fields = query.fields.block;
     let tx_fields = query.fields.transaction;
-    let rpc_batch_size = config.rpc_batch_size.unwrap_or(DEFAULT_RPC_BATCH_SIZE);
-
     let next_block = run_block_historical(
         &provider,
         include_txs,
@@ -329,9 +329,7 @@ async fn run_block_stream(
         &tx_fields,
         from_block,
         snapshot_latest_block,
-        rpc_batch_size,
-        config.batch_size.map(|b| b as u64),
-        config.retry_backoff_ms,
+        &config,
         &tx,
     )
     .await?;
@@ -365,12 +363,14 @@ async fn run_block_historical(
     tx_fields: &TransactionFields,
     start_from: u64,
     snapshot_latest_block: u64,
-    rpc_batch_size: usize,
-    initial_max_block_range: Option<u64>,
-    retry_backoff_ms: u64,
+    config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
-    let original_max_range = initial_max_block_range;
+    let original_max_range = config
+        .batch_size
+        .map(|b| (b as u64).min(DEFAULT_BLOCK_CHUNK_SIZE as u64))
+        .or(Some(DEFAULT_BLOCK_CHUNK_SIZE as u64));
+    let retry_backoff_ms = config.retry_backoff_ms;
     let mut max_block_range = original_max_range;
     let mut from_block = start_from;
 
@@ -379,7 +379,7 @@ async fn run_block_historical(
 
         debug!("Fetching blocks {from_block}..{to_block}");
 
-        match fetch_blocks(provider, from_block, to_block, include_txs, rpc_batch_size).await {
+        match fetch_blocks(provider, from_block, to_block, include_txs).await {
             Ok(blocks) => {
                 let num_blocks = blocks.len();
 
@@ -432,7 +432,7 @@ async fn run_block_historical(
                 let err_str = format!("{e:#}");
 
                 if let Some(retry) =
-                    retry_logs_with_block_range(&err_str, from_block, to_block, max_block_range)
+                    retry_block_with_block_range(&err_str, from_block, to_block, max_block_range)
                 {
                     if retry.backoff {
                         warn!(
@@ -504,8 +504,7 @@ async fn run_block_live(
 
         let to_block = safe_head;
 
-        let rpc_batch_size = config.rpc_batch_size.unwrap_or(DEFAULT_RPC_BATCH_SIZE);
-        match fetch_blocks(provider, from_block, to_block, include_txs, rpc_batch_size).await {
+        match fetch_blocks(provider, from_block, to_block, include_txs).await {
             Ok(blocks) => {
                 let blocks_batch =
                     select_block_columns(blocks_to_record_batch(&blocks), block_fields);
@@ -541,7 +540,7 @@ async fn run_block_live(
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
-                if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
+                if let Some(retry) = retry_block_with_block_range(&err_str, from_block, to_block, None) {
                     debug!(
                         "Live: block range error, will retry with {}-{}",
                         retry.from, retry.to
@@ -609,8 +608,7 @@ async fn run_trace_stream(
         &trace_fields,
         from_block,
         snapshot_latest_block,
-        config.batch_size.map(|b| b as u64),
-        config.retry_backoff_ms,
+        &config,
         &tx,
     )
     .await?;
@@ -639,11 +637,11 @@ async fn run_trace_historical(
     trace_fields: &TraceFields,
     start_from: u64,
     snapshot_latest_block: u64,
-    initial_max_block_range: Option<u64>,
-    retry_backoff_ms: u64,
+    config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
-    let original_max_range = initial_max_block_range;
+    let original_max_range = config.batch_size.map(|b| b as u64);
+    let retry_backoff_ms = config.retry_backoff_ms;
     let mut max_block_range = original_max_range;
     let mut from_block = start_from;
 

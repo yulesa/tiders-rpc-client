@@ -6,4 +6,4 @@ pub(crate) use arrow_convert::{
     select_block_columns, select_log_columns, select_trace_columns, select_transaction_columns,
     traces_to_record_batch, transactions_to_record_batch,
 };
-pub(crate) use block_range::{clamp_to_block, halved_block_range, is_fatal_error, retry_logs_with_block_range};
+pub(crate) use block_range::{clamp_to_block, halved_block_range, is_fatal_error, retry_block_with_block_range, retry_logs_with_block_range};
