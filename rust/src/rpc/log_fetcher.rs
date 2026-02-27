@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use alloy::{
     primitives::{Address as AlloyAddress, B256},
-    providers::Provider,
     rpc::types::{Filter, Log, ValueOrArray},
 };
 use anyhow::{Context, Result};
@@ -19,8 +18,11 @@ use super::log_adaptive_concurrency::retry_logs_with_block_range;
 use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error};
 use crate::query::LogRequest;
 
-use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
+use super::log_adaptive_concurrency::LOG_ADAPTIVE_CONCURRENCY;
 use super::provider::RpcProvider;
+
+/// Default chunk size for `eth_getLogs` batch calls (block range per chunk).
+pub(crate) const DEFAULT_LOG_CHUNK_SIZE: usize = 1000;
 
 /// Maximum number of addresses per `eth_getLogs` call.
 /// RPC providers typically cap at ~1000.
@@ -81,24 +83,8 @@ pub async fn fetch_logs_for_request(
 ) -> Result<Vec<Log>> {
     // If few or no addresses, just do a single request.
     if req.address.len() <= MAX_ADDRESSES_PER_REQUEST {
-        ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-
         let filter = build_filter(req, from_block, to_block);
-        let result = provider
-            .provider
-            .get_logs(&filter)
-            .await
-            .context("eth_getLogs failed");
-
-        match &result {
-            Ok(_) => report_rpc_outcome(&Ok(())),
-            Err(e) => {
-                let err_str = e.to_string();
-                report_rpc_outcome(&Err(&err_str));
-            }
-        }
-
-        return result;
+        return provider.get_logs(&filter).await;
     }
 
     // Build a base filter without addresses — addresses are added per chunk.
@@ -108,8 +94,8 @@ pub async fn fetch_logs_for_request(
     };
     let base_filter = build_filter(&no_addr_req, from_block, to_block);
 
-    // Chunk addresses and spawn parallel fetches with adaptive concurrency.
-    let semaphore = Arc::new(Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
+    // Chunk addresses and spawn parallel fetches bounded by LOG_ADAPTIVE_CONCURRENCY.
+    let semaphore = Arc::new(Semaphore::new(LOG_ADAPTIVE_CONCURRENCY.current()));
 
     let mut handles = Vec::new();
     for chunk in req.address.chunks(MAX_ADDRESSES_PER_REQUEST) {
@@ -124,23 +110,7 @@ pub async fn fetch_logs_for_request(
                 .await
                 .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-            ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-
-            let result = provider_clone
-                .provider
-                .get_logs(&filter)
-                .await
-                .context("eth_getLogs (batched addresses) failed");
-
-            match &result {
-                Ok(_) => report_rpc_outcome(&Ok(())),
-                Err(e) => {
-                    let err_str = e.to_string();
-                    report_rpc_outcome(&Err(&err_str));
-                }
-            }
-
-            result
+            provider_clone.get_logs(&filter).await
         }));
     }
 

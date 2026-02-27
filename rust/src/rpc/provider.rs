@@ -18,7 +18,7 @@ use alloy::{
                 Action, CallAction, CallOutput, CallType, LocalizedTransactionTrace,
                 TraceOutput, TransactionTrace,
             },
-            BlockId, BlockNumberOrTag,
+            BlockId, BlockNumberOrTag, Filter, Log,
         },
     },
     transports::{
@@ -123,7 +123,18 @@ impl RpcProvider {
         Ok(number)
     }
 
-    /// Adds multiple block numbers to call object and 
+    /// Fetch logs matching the given filter via `eth_getLogs`.
+    ///
+    /// This is the low-level RPC primitive — callers (i.e. `log_fetcher`) are
+    /// responsible for filter construction, address batching, and orchestration.
+    pub async fn get_logs(&self, filter: &Filter) -> Result<Vec<Log>> {
+        self.provider
+            .get_logs(filter)
+            .await
+            .context("eth_getLogs failed")
+    }
+
+    /// Adds multiple block numbers to call object and
     /// send a single JSON-RPC `eth_getBlockByNumber` call for the
     /// given batch and return the results.
     ///
