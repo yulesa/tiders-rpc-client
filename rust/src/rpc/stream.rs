@@ -12,9 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::config::ClientConfig;
 use crate::convert::{
-    clamp_to_block,
-    logs_to_record_batch,
-    retry_logs_with_block_range, select_log_columns,
+    logs_to_record_batch, select_log_columns,
     select_trace_columns, traces_to_record_batch,
 };
 use crate::query::{
@@ -23,9 +21,8 @@ use crate::query::{
 };
 use crate::response::ArrowResponse;
 
-use super::block_adaptive_concurrency::{
-    halved_block_range, is_fatal_error,
-};
+use super::log_adaptive_concurrency::retry_logs_with_block_range;
+use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error};
 use super::block_fetcher::{run_block_historical, run_block_live, DEFAULT_BLOCK_CHUNK_SIZE};
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
@@ -579,7 +576,3 @@ async fn run_trace_live(
         }
     }
 }
-
-// ===========================================================================
-// Shared helpers
-// ===========================================================================

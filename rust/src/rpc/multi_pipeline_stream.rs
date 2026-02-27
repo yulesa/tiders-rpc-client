@@ -24,10 +24,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ClientConfig;
 use crate::convert::{
-    blocks_to_record_batch, clamp_to_block, logs_to_record_batch, merge_tx_receipts_into_batch,
+    blocks_to_record_batch, logs_to_record_batch, merge_tx_receipts_into_batch,
     select_block_columns, select_log_columns, select_trace_columns, select_transaction_columns,
     traces_to_record_batch, transactions_to_record_batch,
 };
+use super::shared_helpers::clamp_to_block;
 use crate::query::{
     get_blocks_needs_full_txs, get_trace_method, needs_tx_receipts, LogRequest, Pipelines, Query,
 };

@@ -15,7 +15,8 @@ use anyhow::{Context, Result};
 use log::{error, info, warn};
 use tokio::sync::Semaphore;
 
-use crate::convert::{clamp_to_block, halved_block_range, is_fatal_error, retry_logs_with_block_range};
+use super::log_adaptive_concurrency::retry_logs_with_block_range;
+use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error};
 
 use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
 use super::provider::RpcProvider;

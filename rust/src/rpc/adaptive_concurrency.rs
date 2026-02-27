@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use log::info;
 use once_cell::sync::Lazy;
+// Re-export for callers that import from this module.
+pub use super::shared_helpers::is_rate_limit_error;
 
 /// Global adaptive concurrency controller shared across all RPC call sites.
 /// The first time any call site reads current() or calls wait_for_backoff(),
@@ -168,16 +170,6 @@ pub fn report_rpc_outcome(result: &Result<(), &str>) {
     }
 }
 
-/// Returns `true` if the error string indicates a rate-limit response.
-pub fn is_rate_limit_error(err_str: &str) -> bool {
-    let lower = err_str.to_lowercase();
-    lower.contains("429")
-        || lower.contains("rate limit")
-        || lower.contains("rate-limit")
-        || lower.contains("too many requests")
-        || lower.contains("request limit")
-        || lower.contains("throttle")
-}
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
@@ -225,18 +217,6 @@ mod tests {
         }
         // 190 + 20% = 228, capped at 200
         assert_eq!(ac.current(), 200);
-    }
-
-    #[test]
-    fn rate_limit_detection() {
-        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
-        assert!(is_rate_limit_error("rate limit exceeded"));
-        assert!(is_rate_limit_error("Rate-Limit reached"));
-        assert!(is_rate_limit_error("too many requests"));
-        assert!(is_rate_limit_error("request limit reached"));
-        assert!(is_rate_limit_error("throttled by provider"));
-        assert!(!is_rate_limit_error("connection refused"));
-        assert!(!is_rate_limit_error("block range too large"));
     }
 
     #[test]
