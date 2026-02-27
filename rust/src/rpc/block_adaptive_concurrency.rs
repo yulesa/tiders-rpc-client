@@ -12,10 +12,15 @@ use std::time::Duration;
 
 use log::{info, warn};
 use once_cell::sync::Lazy;
+use rand::Rng;
 
 use super::shared_helpers::{
     halved_block_range, is_fatal_error_lower, pick_min_range, truncate_and_lowercase,
 };
+
+/// Default chunk size for `eth_getBlockByNumber` batch calls.
+/// Each chunk of block numbers is sent as a single JSON-RPC batch request.
+pub const DEFAULT_BLOCK_CHUNK_SIZE: u64 = 200;
 
 /// Global adaptive concurrency controller for block pipeline batch calls.
 pub static BLOCK_ADAPTIVE_CONCURRENCY: Lazy<BlockAdaptiveConcurrency> = Lazy::new(|| {
@@ -44,6 +49,11 @@ pub struct BlockAdaptiveConcurrency {
     backoff_ms: AtomicU64,
     /// Number of consecutive successes required before scaling up.
     scale_up_threshold: usize,
+    /// Current chunk size (block range per RPC batch call). Shrinks on errors,
+    /// occasionally resets to `original_chunk_size` on success.
+    chunk_size: AtomicU64,
+    /// The original chunk size to reset to (set from config or default).
+    original_chunk_size: AtomicU64,
 }
 
 impl BlockAdaptiveConcurrency {
@@ -57,6 +67,8 @@ impl BlockAdaptiveConcurrency {
             consecutive_successes: AtomicUsize::new(0),
             backoff_ms: AtomicU64::new(0),
             scale_up_threshold: 10,
+            chunk_size: AtomicU64::new(DEFAULT_BLOCK_CHUNK_SIZE),
+            original_chunk_size: AtomicU64::new(DEFAULT_BLOCK_CHUNK_SIZE),
         }
     }
 

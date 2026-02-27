@@ -7,6 +7,7 @@
 //! - `fetch_logs_for_request()` — fetch logs for a single `LogRequest`, slipting large addresses filters if needed.
 //! - `build_filter()` — construct an alloy `Filter` from a `LogRequest` and block range.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,14 +17,11 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
-use rand::Rng;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY};
+use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY, DEFAULT_LOG_CHUNK_SIZE};
 use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use crate::config::ClientConfig;
 use crate::convert::{logs_to_record_batch, select_log_columns};
@@ -31,9 +29,6 @@ use crate::query::{LogFields, LogRequest};
 use crate::response::ArrowResponse;
 
 use super::provider::RpcProvider;
-
-/// Default chunk size for `eth_getLogs` batch calls (block range per chunk).
-pub(crate) const DEFAULT_LOG_CHUNK_SIZE: usize = 1000;
 
 /// Maximum number of addresses per `eth_getLogs` call.
 /// RPC providers typically cap at ~1000.
@@ -56,11 +51,12 @@ pub(super) async fn run_log_historical(
 ) -> Result<u64> {
     let original_max_range = config
         .batch_size
-        .map(|b| (b as u64).min(DEFAULT_LOG_CHUNK_SIZE as u64))
-        .unwrap_or(DEFAULT_LOG_CHUNK_SIZE as u64);
+        .map(|b| (b as u64).min(DEFAULT_LOG_CHUNK_SIZE))
+        .unwrap_or(DEFAULT_LOG_CHUNK_SIZE);
 
-    // Shared chunk size — tasks can shrink it via fetch_min on errors.
-    let chunk_size = Arc::new(AtomicU64::new(original_max_range));
+    // Set the original chunk size from config (persisted globally).
+    LOG_ADAPTIVE_CONCURRENCY.set_original_chunk_size(original_max_range);
+
     let cancel = CancellationToken::new();
     let mut join_set: JoinSet<(u64, u64, Result<ArrowResponse>)> = JoinSet::new();
     let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
@@ -77,7 +73,7 @@ pub(super) async fn run_log_historical(
                 (rf, rt)
             } else if cursor <= snapshot_latest_block {
                 // Claim next chunk from cursor.
-                let current_chunk = chunk_size.load(Ordering::Relaxed);
+                let current_chunk = LOG_ADAPTIVE_CONCURRENCY.chunk_size();
                 let from = cursor;
                 let to = (from + current_chunk - 1).min(snapshot_latest_block);
                 cursor = to + 1;
@@ -142,11 +138,7 @@ pub(super) async fn run_log_historical(
                     return Ok(cursor);
                 }
 
-                // 10% random chance to reset chunk_size to original.
-                let mut rng = rand::rng();
-                if rng.random_bool(0.10) {
-                    chunk_size.store(original_max_range, Ordering::Relaxed);
-                }
+                LOG_ADAPTIVE_CONCURRENCY.maybe_reset_chunk_size();
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
@@ -172,7 +164,7 @@ pub(super) async fn run_log_historical(
                 }
 
                 // 3. Block-range errors — provider-specific parsing, shrink chunk, re-queue.
-                let current_range = Some(chunk_size.load(Ordering::Relaxed));
+                let current_range = Some(LOG_ADAPTIVE_CONCURRENCY.chunk_size());
                 if let Some(retry) =
                     retry_logs_with_block_range(&err_str, chunk_from, chunk_to, current_range)
                 {
@@ -181,25 +173,14 @@ pub(super) async fn run_log_historical(
                         retry.from, retry.to
                     );
                     if let Some(new_max) = retry.max_block_range {
-                        chunk_size.fetch_min(new_max, Ordering::Relaxed);
+                        LOG_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_max);
                     }
                     if retry.backoff {
                         LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
                     }
                     retry_queue.push_back((retry.from, retry.to));
-                    // Split the remainder into chunks using max_block_range
-                    // (the most conservative safe range) at 90% so each piece
-                    // has a high chance of succeeding on the first try.
                     if retry.to < chunk_to {
-                        let max_range = retry.max_block_range
-                            .unwrap_or_else(|| retry.to.saturating_sub(retry.from).max(1));
-                        let safe_range = (max_range * 9 / 10).max(1);
-                        let mut rem_from = retry.to + 1;
-                        while rem_from <= chunk_to {
-                            let rem_to = (rem_from + safe_range - 1).min(chunk_to);
-                            retry_queue.push_back((rem_from, rem_to));
-                            rem_from = rem_to + 1;
-                        }
+                        retry_queue.push_back((retry.to + 1, chunk_to));
                     }
                     continue;
                 }
@@ -212,9 +193,8 @@ pub(super) async fn run_log_historical(
                      re-queuing {chunk_from}-{halved}: {err_str}"
                 );
                 let new_range = halved.saturating_sub(chunk_from);
-                chunk_size.fetch_min(new_range, Ordering::Relaxed);
+                LOG_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_range);
                 retry_queue.push_back((chunk_from, halved));
-                // If there's a remainder after the halved portion, re-queue that too.
                 if halved < chunk_to {
                     retry_queue.push_back((halved + 1, chunk_to));
                 }
@@ -448,7 +428,7 @@ mod tests {
     use super::*;
     use alloy::network::AnyNetwork;
     use alloy::primitives::{address, b256};
-    use alloy::providers::ProviderBuilder;
+    use alloy::providers::{Provider, ProviderBuilder};
 
     /// Smoke test: call eth_getLogs directly via a plain alloy provider
     /// (no retry layer) to verify the RPC + filter return logs.

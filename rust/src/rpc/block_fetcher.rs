@@ -7,14 +7,11 @@
 //! - `run_block_live`: live head-polling for blocks
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::network::AnyRpcBlock;
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
-use rand::Rng;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -27,14 +24,10 @@ use crate::convert::{
 use crate::query::{BlockFields, TransactionFields};
 use crate::response::ArrowResponse;
 
-use super::block_adaptive_concurrency::{retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY};
+use super::block_adaptive_concurrency::{retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY, DEFAULT_BLOCK_CHUNK_SIZE};
 use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use super::provider::RpcProvider;
 use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
-
-/// Default chunk size for `eth_getBlockByNumber` batch calls.
-/// Each chunk of block numbers is sent as a single JSON-RPC batch request.
-pub(crate) const DEFAULT_BLOCK_CHUNK_SIZE: usize = 200;
 
 /// Historical phase for the block pipeline: iterate `[from_block, snapshot_latest_block]`
 /// in chunks, fetch blocks (and optionally tx receipts), and send Arrow responses.
@@ -56,11 +49,12 @@ pub(super) async fn run_block_historical(
 ) -> Result<u64> {
     let original_max_range = config
         .batch_size
-        .map(|b| (b as u64).min(DEFAULT_BLOCK_CHUNK_SIZE as u64))
-        .unwrap_or(DEFAULT_BLOCK_CHUNK_SIZE as u64);
+        .map(|b| (b as u64).min(DEFAULT_BLOCK_CHUNK_SIZE))
+        .unwrap_or(DEFAULT_BLOCK_CHUNK_SIZE);
 
-    // Shared chunk size — tasks can shrink it via fetch_min on errors.
-    let chunk_size = Arc::new(AtomicU64::new(original_max_range));
+    // Set the original chunk size from config (persisted globally).
+    BLOCK_ADAPTIVE_CONCURRENCY.set_original_chunk_size(original_max_range);
+
     let cancel = CancellationToken::new();
     let mut join_set: JoinSet<(u64, u64, Result<ArrowResponse>)> = JoinSet::new();
     let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
@@ -80,7 +74,7 @@ pub(super) async fn run_block_historical(
                 (rf, rt)
             } else if cursor <= snapshot_latest_block {
                 // Claim next chunk from cursor.
-                let current_chunk = chunk_size.load(Ordering::Relaxed);
+                let current_chunk = BLOCK_ADAPTIVE_CONCURRENCY.chunk_size();
                 let from = cursor;
                 let to = (from + current_chunk - 1).min(snapshot_latest_block);
                 cursor = to + 1;
@@ -93,7 +87,6 @@ pub(super) async fn run_block_historical(
             // Spawn a fetch task.
             let task_provider = provider.clone();
             let task_cancel = cancel.clone();
-            let task_chunk_size = Arc::clone(&chunk_size);
 
             join_set.spawn(async move {
                 if task_cancel.is_cancelled() {
@@ -108,7 +101,7 @@ pub(super) async fn run_block_historical(
                     fetch_receipts_flag,
                     &block_fields,
                     &tx_fields,
-                    Some(task_chunk_size.load(Ordering::Relaxed)),
+                    Some(BLOCK_ADAPTIVE_CONCURRENCY.chunk_size()),
                 )
                 .await;
 
@@ -149,11 +142,7 @@ pub(super) async fn run_block_historical(
                     return Ok(cursor);
                 }
 
-                // 10% random chance to reset chunk_size to original.
-                let mut rng = rand::rng();
-                if rng.random_bool(0.10) {
-                    chunk_size.store(original_max_range, Ordering::Relaxed);
-                }
+                BLOCK_ADAPTIVE_CONCURRENCY.maybe_reset_chunk_size();
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
@@ -179,7 +168,7 @@ pub(super) async fn run_block_historical(
                 }
 
                 // 3. Retryable block-range errors — shrink chunk only, no concurrency change.
-                let current_range = Some(chunk_size.load(Ordering::Relaxed));
+                let current_range = Some(BLOCK_ADAPTIVE_CONCURRENCY.chunk_size());
                 if let Some(retry) =
                     retry_block_with_block_range(&err_str, chunk_from, chunk_to, current_range)
                 {
@@ -188,13 +177,12 @@ pub(super) async fn run_block_historical(
                         retry.from, retry.to
                     );
                     if let Some(new_max) = retry.max_block_range {
-                        chunk_size.fetch_min(new_max, Ordering::Relaxed);
+                        BLOCK_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_max);
                     }
                     if retry.backoff {
                         BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
                     }
                     retry_queue.push_back((retry.from, retry.to));
-                    // If there's a remainder after the retried portion, re-queue that too.
                     if retry.to < chunk_to {
                         retry_queue.push_back((retry.to + 1, chunk_to));
                     }
@@ -209,9 +197,8 @@ pub(super) async fn run_block_historical(
                      re-queuing {chunk_from}-{halved}: {err_str}"
                 );
                 let new_range = halved.saturating_sub(chunk_from);
-                chunk_size.fetch_min(new_range, Ordering::Relaxed);
+                BLOCK_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_range);
                 retry_queue.push_back((chunk_from, halved));
-                // If there's a remainder after the halved portion, re-queue that too.
                 if halved < chunk_to {
                     retry_queue.push_back((halved + 1, chunk_to));
                 }

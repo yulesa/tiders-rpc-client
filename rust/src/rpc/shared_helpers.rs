@@ -11,7 +11,7 @@ pub fn clamp_to_block(
     max_block_range: Option<u64>,
 ) -> u64 {
     if let Some(max) = max_block_range {
-        let to = from_block.saturating_add(max);
+        let to = from_block.saturating_add(max.saturating_sub(1));
         to.min(snapshot_to_block)
     } else {
         snapshot_to_block
@@ -75,7 +75,9 @@ mod tests {
 
     #[test]
     fn clamp_to_block_with_max_range() {
-        assert_eq!(clamp_to_block(100, 500, Some(50)), 150);
+        // from=100, max=50 → inclusive range 100..=149 = 50 blocks
+        assert_eq!(clamp_to_block(100, 500, Some(50)), 149);
+        // Clamped to snapshot_to_block when range exceeds it
         assert_eq!(clamp_to_block(100, 120, Some(50)), 120);
         assert_eq!(clamp_to_block(100, 500, None), 500);
     }

@@ -11,8 +11,6 @@
 //! response.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::network::AnyRpcBlock;
@@ -36,9 +34,9 @@ use crate::response::ArrowResponse;
 
 use super::block_adaptive_concurrency::{retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY};
 use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
-use super::block_fetcher::{fetch_blocks, DEFAULT_BLOCK_CHUNK_SIZE};
+use super::block_fetcher::fetch_blocks;
 use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY};
-use super::log_fetcher::{fetch_logs, DEFAULT_LOG_CHUNK_SIZE};
+use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces_with_retry;
 use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
@@ -296,7 +294,6 @@ async fn fetch_logs_concurrent(
         return Ok(Vec::new());
     }
 
-    let chunk_size = Arc::new(AtomicU64::new(DEFAULT_LOG_CHUNK_SIZE as u64));
     let cancel = CancellationToken::new();
     let mut join_set: JoinSet<(u64, u64, Result<Vec<alloy::rpc::types::Log>>)> = JoinSet::new();
     let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
@@ -310,7 +307,7 @@ async fn fetch_logs_concurrent(
             let (chunk_from, chunk_to) = if let Some((rf, rt)) = retry_queue.pop_front() {
                 (rf, rt)
             } else if cursor <= to_block {
-                let current_chunk = chunk_size.load(Ordering::Relaxed);
+                let current_chunk = LOG_ADAPTIVE_CONCURRENCY.chunk_size();
                 let from = cursor;
                 let to = (from + current_chunk - 1).min(to_block);
                 cursor = to + 1;
@@ -381,8 +378,8 @@ async fn fetch_logs_concurrent(
                     continue;
                 }
 
-                // 3. Block-range errors — shrink chunk, re-queue with remainder splitting.
-                let current_range = Some(chunk_size.load(Ordering::Relaxed));
+                // 3. Block-range errors — shrink chunk, re-queue.
+                let current_range = Some(LOG_ADAPTIVE_CONCURRENCY.chunk_size());
                 if let Some(retry) =
                     retry_logs_with_block_range(&err_str, chunk_from, chunk_to, current_range)
                 {
@@ -391,22 +388,14 @@ async fn fetch_logs_concurrent(
                         retry.from, retry.to
                     );
                     if let Some(new_max) = retry.max_block_range {
-                        chunk_size.fetch_min(new_max, Ordering::Relaxed);
+                        LOG_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_max);
                     }
                     if retry.backoff {
                         LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
                     }
                     retry_queue.push_back((retry.from, retry.to));
                     if retry.to < chunk_to {
-                        let max_range = retry.max_block_range
-                            .unwrap_or_else(|| retry.to.saturating_sub(retry.from).max(1));
-                        let safe_range = (max_range * 9 / 10).max(1);
-                        let mut rem_from = retry.to + 1;
-                        while rem_from <= chunk_to {
-                            let rem_to = (rem_from + safe_range - 1).min(chunk_to);
-                            retry_queue.push_back((rem_from, rem_to));
-                            rem_from = rem_to + 1;
-                        }
+                        retry_queue.push_back((retry.to + 1, chunk_to));
                     }
                     continue;
                 }
@@ -419,7 +408,7 @@ async fn fetch_logs_concurrent(
                      re-queuing {chunk_from}-{halved}: {err_str}"
                 );
                 let new_range = halved.saturating_sub(chunk_from);
-                chunk_size.fetch_min(new_range, Ordering::Relaxed);
+                LOG_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_range);
                 retry_queue.push_back((chunk_from, halved));
                 if halved < chunk_to {
                     retry_queue.push_back((halved + 1, chunk_to));
@@ -457,7 +446,6 @@ async fn fetch_blocks_concurrent(
         return Ok(Vec::new());
     }
 
-    let chunk_size = Arc::new(AtomicU64::new(DEFAULT_BLOCK_CHUNK_SIZE as u64));
     let cancel = CancellationToken::new();
     let mut join_set: JoinSet<(u64, u64, Result<Vec<AnyRpcBlock>>)> = JoinSet::new();
     let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
@@ -472,7 +460,7 @@ async fn fetch_blocks_concurrent(
             let (chunk_from, chunk_to) = if let Some((rf, rt)) = retry_queue.pop_front() {
                 (rf, rt)
             } else if cursor <= to_block {
-                let current_chunk = chunk_size.load(Ordering::Relaxed);
+                let current_chunk = BLOCK_ADAPTIVE_CONCURRENCY.chunk_size();
                 let from = cursor;
                 let to = (from + current_chunk - 1).min(to_block);
                 cursor = to + 1;
@@ -543,7 +531,7 @@ async fn fetch_blocks_concurrent(
                 }
 
                 // 3. Retryable block-range errors — shrink chunk only.
-                let current_range = Some(chunk_size.load(Ordering::Relaxed));
+                let current_range = Some(BLOCK_ADAPTIVE_CONCURRENCY.chunk_size());
                 if let Some(retry) =
                     retry_block_with_block_range(&err_str, chunk_from, chunk_to, current_range)
                 {
@@ -552,7 +540,7 @@ async fn fetch_blocks_concurrent(
                         retry.from, retry.to
                     );
                     if let Some(new_max) = retry.max_block_range {
-                        chunk_size.fetch_min(new_max, Ordering::Relaxed);
+                        BLOCK_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_max);
                     }
                     if retry.backoff {
                         BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
@@ -572,7 +560,7 @@ async fn fetch_blocks_concurrent(
                      re-queuing {chunk_from}-{halved}: {err_str}"
                 );
                 let new_range = halved.saturating_sub(chunk_from);
-                chunk_size.fetch_min(new_range, Ordering::Relaxed);
+                BLOCK_ADAPTIVE_CONCURRENCY.reduce_chunk_size(new_range);
                 retry_queue.push_back((chunk_from, halved));
                 if halved < chunk_to {
                     retry_queue.push_back((halved + 1, chunk_to));

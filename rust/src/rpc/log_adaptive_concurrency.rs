@@ -15,11 +15,15 @@ use std::time::Duration;
 
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
+use rand::Rng;
 use regex::Regex;
 
 use super::shared_helpers::{
     halved_block_range, is_fatal_error_lower, pick_min_range, truncate_and_lowercase,
 };
+
+/// Default chunk size for `eth_getLogs` batch calls (block range per chunk).
+pub const DEFAULT_LOG_CHUNK_SIZE: u64 = 1000;
 
 /// Global adaptive concurrency controller for log pipeline batch calls.
 pub static LOG_ADAPTIVE_CONCURRENCY: Lazy<LogAdaptiveConcurrency> = Lazy::new(|| {
@@ -48,6 +52,11 @@ pub struct LogAdaptiveConcurrency {
     backoff_ms: AtomicU64,
     /// Number of consecutive successes required before scaling up.
     scale_up_threshold: usize,
+    /// Current chunk size (block range per eth_getLogs call). Shrinks on errors,
+    /// occasionally resets to `original_chunk_size` on success.
+    chunk_size: AtomicU64,
+    /// The original chunk size to reset to (set from config or default).
+    original_chunk_size: AtomicU64,
 }
 
 impl LogAdaptiveConcurrency {
@@ -61,6 +70,8 @@ impl LogAdaptiveConcurrency {
             consecutive_successes: AtomicUsize::new(0),
             backoff_ms: AtomicU64::new(0),
             scale_up_threshold: 10,
+            chunk_size: AtomicU64::new(DEFAULT_LOG_CHUNK_SIZE),
+            original_chunk_size: AtomicU64::new(DEFAULT_LOG_CHUNK_SIZE),
         }
     }
 
@@ -152,6 +163,32 @@ impl LogAdaptiveConcurrency {
         let ms = self.backoff_ms.load(Ordering::Relaxed);
         if ms > 0 {
             tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
+
+    /// Return the current chunk size (block range per batch call).
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size.load(Ordering::Relaxed)
+    }
+
+    /// Set the original chunk size (from config). Also resets the current
+    /// chunk size if it is larger than the new original.
+    pub fn set_original_chunk_size(&self, size: u64) {
+        self.original_chunk_size.store(size, Ordering::Relaxed);
+        self.chunk_size.fetch_min(size, Ordering::Relaxed);
+    }
+
+    /// Reduce the chunk size to at most `new_max`.
+    pub fn reduce_chunk_size(&self, new_max: u64) {
+        self.chunk_size.fetch_min(new_max, Ordering::Relaxed);
+    }
+
+    /// With a 10% probability, reset chunk size to the original value.
+    pub fn maybe_reset_chunk_size(&self) {
+        let mut rng = rand::rng();
+        if rng.random_bool(0.10) {
+            let original = self.original_chunk_size.load(Ordering::Relaxed);
+            self.chunk_size.store(original, Ordering::Relaxed);
         }
     }
 }
