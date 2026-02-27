@@ -3,8 +3,9 @@
 //! Adapted from rindexer's `get_logs()` and `get_logs_for_address_in_batches()`
 //! (provider.rs:566-640).
 
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::{
     primitives::{Address as AlloyAddress, B256},
@@ -13,9 +14,11 @@ use alloy::{
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use super::log_adaptive_concurrency::retry_logs_with_block_range;
-use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error};
+use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use crate::query::LogRequest;
 
 use super::log_adaptive_concurrency::LOG_ADAPTIVE_CONCURRENCY;
@@ -123,59 +126,167 @@ pub async fn fetch_logs_for_request(
     Ok(all_logs)
 }
 
-/// Fetch logs for `[from_block, to_block]`, automatically splitting into narrower
-/// sub-ranges on provider block-range errors and accumulating results.
-pub(super) async fn fetch_logs_with_retry(
+/// Fetch logs for `[from_block, to_block]` using concurrent JoinSet tasks,
+/// automatically splitting into sub-chunks on block-range errors and
+/// accumulating all results before returning.
+///
+/// This is the log equivalent of `fetch_blocks_concurrent` in
+/// `multi_pipeline_stream`: it collects raw logs in memory rather than
+/// streaming Arrow responses, because the coordinated pipeline needs to merge
+/// them with blocks/traces before sending.
+pub(super) async fn fetch_logs_concurrent(
     provider: &RpcProvider,
     requests: &[LogRequest],
     from_block: u64,
     to_block: u64,
-    initial_max_block_range: Option<u64>,
-    retry_backoff_ms: u64,
 ) -> Result<Vec<Log>> {
+    if from_block > to_block {
+        return Ok(Vec::new());
+    }
+
+    let original_max_range = DEFAULT_LOG_CHUNK_SIZE as u64;
+    let chunk_size = Arc::new(AtomicU64::new(original_max_range));
+    let cancel = CancellationToken::new();
+    let mut join_set: JoinSet<(u64, u64, Result<Vec<Log>>)> = JoinSet::new();
+    let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
     let mut all_logs: Vec<Log> = Vec::new();
-    let mut sub_from = from_block;
-    let mut max_block_range = initial_max_block_range;
 
-    while sub_from <= to_block {
-        let sub_to = clamp_to_block(sub_from, to_block, max_block_range);
+    let mut cursor = from_block;
 
-        match fetch_logs(provider, requests, sub_from, sub_to).await {
+    loop {
+        // Fill join_set up to the current concurrency limit.
+        let max_concurrent = LOG_ADAPTIVE_CONCURRENCY.current();
+        while join_set.len() < max_concurrent {
+            let (chunk_from, chunk_to) = if let Some((rf, rt)) = retry_queue.pop_front() {
+                (rf, rt)
+            } else if cursor <= to_block {
+                let current_chunk = chunk_size.load(Ordering::Relaxed);
+                let from = cursor;
+                let to = (from + current_chunk - 1).min(to_block);
+                cursor = to + 1;
+                (from, to)
+            } else {
+                break;
+            };
+
+            let task_provider = provider.clone();
+            let task_cancel = cancel.clone();
+            let task_requests: Vec<LogRequest> = requests.to_vec();
+
+            join_set.spawn(async move {
+                if task_cancel.is_cancelled() {
+                    return (chunk_from, chunk_to, Err(anyhow::anyhow!("cancelled")));
+                }
+
+                LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+
+                let result = fetch_logs(&task_provider, &task_requests, chunk_from, chunk_to).await;
+                (chunk_from, chunk_to, result)
+            });
+        }
+
+        if join_set.is_empty() {
+            break;
+        }
+
+        let Some(join_result) = join_set.join_next().await else {
+            break;
+        };
+
+        let (chunk_from, chunk_to, task_result) = match join_result {
+            Ok(tuple) => tuple,
+            Err(join_err) => {
+                error!("Log fetch task panicked: {join_err}");
+                cancel.cancel();
+                while join_set.join_next().await.is_some() {}
+                return Err(anyhow::anyhow!("log fetch task panicked: {join_err}"));
+            }
+        };
+
+        match task_result {
             Ok(logs) => {
+                LOG_ADAPTIVE_CONCURRENCY.record_success();
                 all_logs.extend(logs);
-                sub_from = sub_to + 1;
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
 
-                if let Some(retry) =
-                    retry_logs_with_block_range(&err_str, sub_from, sub_to, max_block_range)
-                {
-                    warn!(
-                        "Log pipeline range error, retrying {}-{} (was {sub_from}-{sub_to}), backing off {retry_backoff_ms}ms",
-                        retry.from, retry.to
-                    );
-                    if retry.backoff {
-                        tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
-                    }
-                    sub_from = retry.from;
-                    max_block_range = retry.max_block_range;
-                    continue;
-                }
-
+                // 1. Fatal errors — cancel everything and return.
                 if is_fatal_error(&err_str) {
+                    cancel.cancel();
+                    while join_set.join_next().await.is_some() {}
                     return Err(e);
                 }
 
-                let halved = halved_block_range(sub_from, sub_to);
+                // Cancelled tasks — just drop them.
+                if cancel.is_cancelled() {
+                    continue;
+                }
+
+                // 2. Rate-limit errors — reduce concurrency, backoff, re-queue.
+                if is_rate_limit_error(&err_str) {
+                    LOG_ADAPTIVE_CONCURRENCY.record_rate_limit();
+                    LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                    retry_queue.push_back((chunk_from, chunk_to));
+                    continue;
+                }
+
+                // 3. Block-range errors — shrink chunk, re-queue with remainder splitting.
+                let current_range = Some(chunk_size.load(Ordering::Relaxed));
+                if let Some(retry) =
+                    retry_logs_with_block_range(&err_str, chunk_from, chunk_to, current_range)
+                {
+                    warn!(
+                        "Log range error, re-queuing {}-{} (was {chunk_from}-{chunk_to})",
+                        retry.from, retry.to
+                    );
+                    if let Some(new_max) = retry.max_block_range {
+                        chunk_size.fetch_min(new_max, Ordering::Relaxed);
+                    }
+                    if retry.backoff {
+                        LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                    }
+                    retry_queue.push_back((retry.from, retry.to));
+                    // Split remainder at 90% of max_block_range.
+                    if retry.to < chunk_to {
+                        let max_range = retry.max_block_range
+                            .unwrap_or_else(|| retry.to.saturating_sub(retry.from).max(1));
+                        let safe_range = (max_range * 9 / 10).max(1);
+                        let mut rem_from = retry.to + 1;
+                        while rem_from <= chunk_to {
+                            let rem_to = (rem_from + safe_range - 1).min(chunk_to);
+                            retry_queue.push_back((rem_from, rem_to));
+                            rem_from = rem_to + 1;
+                        }
+                    }
+                    continue;
+                }
+
+                // 4. Unknown error — halve range and re-queue.
+                LOG_ADAPTIVE_CONCURRENCY.record_error();
+                let halved = halved_block_range(chunk_from, chunk_to);
                 error!(
-                    "Log pipeline unexpected error {sub_from}-{sub_to}, \
-                     retrying {sub_from}-{halved}: {err_str}"
+                    "Unexpected error fetching logs {chunk_from}-{chunk_to}, \
+                     re-queuing {chunk_from}-{halved}: {err_str}"
                 );
-                max_block_range = Some(halved.saturating_sub(sub_from));
+                let new_range = halved.saturating_sub(chunk_from);
+                chunk_size.fetch_min(new_range, Ordering::Relaxed);
+                retry_queue.push_back((chunk_from, halved));
+                if halved < chunk_to {
+                    retry_queue.push_back((halved + 1, chunk_to));
+                }
             }
         }
     }
+
+    // Sort by (block_number, log_index) for deterministic ordering.
+    all_logs.sort_by(|a, b| {
+        let block_cmp = a.block_number.cmp(&b.block_number);
+        if block_cmp != std::cmp::Ordering::Equal {
+            return block_cmp;
+        }
+        a.log_index.cmp(&b.log_index)
+    });
 
     Ok(all_logs)
 }

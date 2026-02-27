@@ -39,7 +39,7 @@ use super::block_adaptive_concurrency::{
     BLOCK_ADAPTIVE_CONCURRENCY,
 };
 use super::block_fetcher::{fetch_blocks, DEFAULT_BLOCK_CHUNK_SIZE};
-use super::log_fetcher::fetch_logs_with_retry;
+use super::log_fetcher::fetch_logs_concurrent;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces_with_retry;
 use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
@@ -256,7 +256,7 @@ async fn fetch_all(
     // --- Log pipeline ---
     let logs_batch = if pipelines.logs {
         let log_requests = vec![LogRequest::default()];
-        let logs = fetch_logs_with_retry(provider, &log_requests, from_block, to_block, max_block_range, retry_backoff_ms).await?;
+        let logs = fetch_logs_concurrent(provider, &log_requests, from_block, to_block).await?;
         select_log_columns(logs_to_record_batch(&logs), &query.fields.log)
     } else {
         ArrowResponse::empty().logs

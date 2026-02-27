@@ -257,9 +257,19 @@ async fn run_log_historical(
                         LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
                     }
                     retry_queue.push_back((retry.from, retry.to));
-                    // If there's a remainder after the retried portion, re-queue that too.
+                    // Split the remainder into chunks using max_block_range
+                    // (the most conservative safe range) at 90% so each piece
+                    // has a high chance of succeeding on the first try.
                     if retry.to < chunk_to {
-                        retry_queue.push_back((retry.to + 1, chunk_to));
+                        let max_range = retry.max_block_range
+                            .unwrap_or_else(|| retry.to.saturating_sub(retry.from).max(1));
+                        let safe_range = (max_range * 9 / 10).max(1);
+                        let mut rem_from = retry.to + 1;
+                        while rem_from <= chunk_to {
+                            let rem_to = (rem_from + safe_range - 1).min(chunk_to);
+                            retry_queue.push_back((rem_from, rem_to));
+                            rem_from = rem_to + 1;
+                        }
                     }
                     continue;
                 }
@@ -345,6 +355,17 @@ async fn run_log_live(
             }
             Err(e) => {
                 let err_str = format!("{e:#}");
+
+                if is_fatal_error(&err_str) {
+                    return Err(e);
+                }
+
+                if is_rate_limit_error(&err_str) {
+                    LOG_ADAPTIVE_CONCURRENCY.record_rate_limit();
+                    LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                    continue;
+                }
+
                 if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
                     debug!(
                         "Live: block range error, will retry with {}-{}",
@@ -352,6 +373,7 @@ async fn run_log_live(
                     );
                     // Don't advance — the next iteration will clamp naturally.
                 } else {
+                    LOG_ADAPTIVE_CONCURRENCY.record_error();
                     error!(
                         "Live: unexpected error fetching logs {from_block}-{to_block}: {err_str}, retrying in {}ms",
                         config.retry_backoff_ms
