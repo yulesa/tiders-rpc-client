@@ -38,7 +38,7 @@ use super::block_fetcher::fetch_blocks;
 use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY};
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
-use super::trace_fetcher::fetch_traces_with_retry;
+use super::trace_fetcher::fetch_traces;
 use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
 
 /// Spawn a coordinated producer task that runs and all
@@ -221,9 +221,6 @@ async fn fetch_all(
     to_block: u64,
     config: &ClientConfig,
 ) -> Result<ArrowResponse> {
-    let max_block_range = config.batch_size.map(|b| b as u64);
-    let retry_backoff_ms = config.retry_backoff_ms;
-
     // --- Block pipeline (blocks + transactions) ---
     let (blocks_batch, txs_batch) = if pipelines.blocks_transactions {
         let include_txs = get_blocks_needs_full_txs(query);
@@ -262,7 +259,7 @@ async fn fetch_all(
     // --- Trace pipeline ---
     let traces_batch = if pipelines.traces {
         let trace_method = get_trace_method(query);
-        let traces = fetch_traces_with_retry(provider, from_block, to_block, trace_method, max_block_range, retry_backoff_ms).await?;
+        let traces = fetch_traces(provider, from_block, to_block, trace_method, config).await?;
         select_trace_columns(traces_to_record_batch(&traces), &query.fields.trace)
     } else {
         ArrowResponse::empty().traces

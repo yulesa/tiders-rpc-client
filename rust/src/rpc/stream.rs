@@ -6,8 +6,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use log::{debug, error, info, warn};
-use rand::Rng;
+use log::{debug, error, info};
 use tokio::sync::mpsc;
 
 use crate::config::ClientConfig;
@@ -19,7 +18,6 @@ use crate::query::{
 use crate::response::ArrowResponse;
 
 use super::log_adaptive_concurrency::retry_logs_with_block_range;
-use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error};
 use super::block_fetcher::{run_block_historical, run_block_live};
 use super::log_fetcher::{run_log_historical, run_log_live};
 use super::provider::RpcProvider;
@@ -260,73 +258,30 @@ async fn run_trace_historical(
     config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
-    let original_max_range = config.batch_size.map(|b| b as u64);
-    let retry_backoff_ms = config.retry_backoff_ms;
-    let mut max_block_range = original_max_range;
+    use super::single_block_adaptive_concurrency::DEFAULT_SINGLE_BLOCK_CHUNK_SIZE;
+
+    let chunk_size = config.batch_size.map(|b| b as u64).unwrap_or(DEFAULT_SINGLE_BLOCK_CHUNK_SIZE);
     let mut from_block = start_from;
 
     while from_block <= snapshot_latest_block {
-        let to_block = clamp_to_block(from_block, snapshot_latest_block, max_block_range);
+        let to_block = (from_block + chunk_size - 1).min(snapshot_latest_block);
 
         debug!("Fetching traces for blocks {from_block}..{to_block}");
 
-        match fetch_traces(provider, from_block, to_block, trace_method).await {
-            Ok(traces) => {
-                let num_traces = traces.len();
-                info!("Fetched {num_traces} traces between blocks {from_block}-{to_block}");
+        let traces = fetch_traces(provider, from_block, to_block, trace_method, config).await?;
 
-                let traces_batch =
-                    select_trace_columns(traces_to_record_batch(&traces), trace_fields);
-                let response = ArrowResponse::with_traces(traces_batch);
+        let num_traces = traces.len();
+        info!("Fetched {num_traces} traces between blocks {from_block}-{to_block}");
 
-                if tx.send(Ok(response)).await.is_err() {
-                    debug!("Stream consumer dropped, stopping historical trace fetch");
-                    return Ok(from_block);
-                }
+        let traces_batch = select_trace_columns(traces_to_record_batch(&traces), trace_fields);
+        let response = ArrowResponse::with_traces(traces_batch);
 
-                from_block = to_block + 1;
-
-                let mut rng = rand::rng();
-                if rng.random_bool(0.10) {
-                    max_block_range = original_max_range;
-                }
-            }
-            Err(e) => {
-                let err_str = format!("{e:#}");
-
-                if let Some(retry) =
-                    retry_logs_with_block_range(&err_str, from_block, to_block, max_block_range)
-                {
-                    if retry.backoff {
-                        warn!(
-                            "Trace range error, retrying with {}-{} (was {from_block}-{to_block}), backing off {retry_backoff_ms}ms",
-                            retry.from, retry.to
-                        );
-                        tokio::time::sleep(Duration::from_millis(retry_backoff_ms)).await;
-                    } else {
-                        warn!(
-                            "Trace range error, retrying with {}-{} (was {from_block}-{to_block})",
-                            retry.from, retry.to
-                        );
-                    }
-                    from_block = retry.from;
-                    max_block_range = retry.max_block_range;
-                    continue;
-                }
-
-                // Fatal errors are not recoverable — propagate immediately.
-                if is_fatal_error(&err_str) {
-                    return Err(e);
-                }
-
-                let halved = halved_block_range(from_block, to_block);
-                error!(
-                    "Unexpected error fetching traces {from_block}-{to_block}, \
-                     retrying {from_block}-{halved}: {err_str}"
-                );
-                max_block_range = Some(halved.saturating_sub(from_block));
-            }
+        if tx.send(Ok(response)).await.is_err() {
+            debug!("Stream consumer dropped, stopping historical trace fetch");
+            return Ok(from_block);
         }
+
+        from_block = to_block + 1;
     }
 
     Ok(from_block)
@@ -365,7 +320,7 @@ async fn run_trace_live(
 
         let to_block = safe_head;
 
-        match fetch_traces(provider, from_block, to_block, trace_method).await {
+        match fetch_traces(provider, from_block, to_block, trace_method, config).await {
             Ok(traces) => {
                 let num_traces = traces.len();
 

@@ -1,4 +1,4 @@
-pub(crate) mod adaptive_concurrency;
+pub(crate) mod single_block_adaptive_concurrency;
 pub(crate) mod block_adaptive_concurrency;
 pub(crate) mod block_fetcher;
 pub(crate) mod log_adaptive_concurrency;

@@ -1,9 +1,9 @@
-//! Global adaptive concurrency controller for RPC calls.
+//! Adaptive concurrency controller for single-block RPC calls.
 //!
 //! A single [`AdaptiveConcurrency`] instance governs concurrency limits and
-//! backoff across **all** RPC call sites. When any call site hits a rate limit,
-//! every call site slows down; when calls succeed consistently, the system
-//! gradually scales back up.
+//! backoff for per-block RPC calls (trace_block, debug_traceBlockByNumber).
+//! When any call site hits a rate limit, every call site slows down; when
+//! calls succeed consistently, the system gradually scales back up.
 //!
 //! All state is stored in atomics for lock-free access from concurrent tasks.
 
@@ -15,15 +15,20 @@ use once_cell::sync::Lazy;
 // Re-export for callers that import from this module.
 pub use super::shared_helpers::is_rate_limit_error;
 
-/// Global adaptive concurrency controller shared across all RPC call sites.
+/// Default chunk size for single-block RPC calls (e.g. trace_block).
+/// Each chunk of blocks is processed as a semaphore-bounded parallel batch,
+/// and one `ArrowResponse` is emitted per chunk.
+pub const DEFAULT_SINGLE_BLOCK_CHUNK_SIZE: u64 = 200;
+
+/// Global adaptive concurrency controller for single-block RPC calls.
 /// The first time any call site reads current() or calls wait_for_backoff(),
 /// Lazy runs the closure and constructs the singleton. After that, every
 /// subsequent access returns the same instance.
-pub static ADAPTIVE_CONCURRENCY: Lazy<AdaptiveConcurrency> = Lazy::new(|| {
+pub static SINGLE_BLOCK_ADAPTIVE_CONCURRENCY: Lazy<AdaptiveConcurrency> = Lazy::new(|| {
     AdaptiveConcurrency::new(
-        10,  // initial concurrent calls
-        2,   // minimum
-        200, // maximum
+        100,  // initial concurrent calls
+        10,   // minimum
+        2000, // maximum
     )
 });
 
@@ -96,7 +101,7 @@ impl AdaptiveConcurrency {
             self.current.store(new, Ordering::Relaxed);
 
             info!(
-                "adaptive concurrency: scaled up {old} -> {new} after {threshold} consecutive successes",
+                "single-block adaptive concurrency: scaled up {old} -> {new} after {threshold} consecutive successes",
                 threshold = self.scale_up_threshold,
             );
         }
@@ -125,7 +130,7 @@ impl AdaptiveConcurrency {
         self.current.store(new, Ordering::Relaxed);
 
         info!(
-            "adaptive concurrency: rate limit — concurrency {old} -> {new}, backoff {new_backoff}ms",
+            "single-block adaptive concurrency: rate limit — concurrency {old} -> {new}, backoff {new_backoff}ms",
         );
     }
 
@@ -142,7 +147,7 @@ impl AdaptiveConcurrency {
         let new = old.saturating_sub(decrement).max(self.min);
         self.current.store(new, Ordering::Relaxed);
 
-        info!("adaptive concurrency: error — concurrency {old} -> {new}");
+        info!("single-block adaptive concurrency: error — concurrency {old} -> {new}");
     }
 
     /// Sleep for the current backoff duration (no-op if backoff is 0).
@@ -159,12 +164,12 @@ impl AdaptiveConcurrency {
 /// Call this after every RPC call to feed success/error signals.
 pub fn report_rpc_outcome(result: &Result<(), &str>) {
     match result {
-        Ok(()) => ADAPTIVE_CONCURRENCY.record_success(),
+        Ok(()) => SINGLE_BLOCK_ADAPTIVE_CONCURRENCY.record_success(),
         Err(err_str) => {
             if is_rate_limit_error(err_str) {
-                ADAPTIVE_CONCURRENCY.record_rate_limit();
+                SINGLE_BLOCK_ADAPTIVE_CONCURRENCY.record_rate_limit();
             } else {
-                ADAPTIVE_CONCURRENCY.record_error();
+                SINGLE_BLOCK_ADAPTIVE_CONCURRENCY.record_error();
             }
         }
     }

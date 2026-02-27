@@ -18,7 +18,7 @@ use tokio::sync::Semaphore;
 use super::log_adaptive_concurrency::retry_logs_with_block_range;
 use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error};
 
-use super::adaptive_concurrency::{report_rpc_outcome, ADAPTIVE_CONCURRENCY};
+use super::single_block_adaptive_concurrency::{report_rpc_outcome, SINGLE_BLOCK_ADAPTIVE_CONCURRENCY};
 use super::provider::RpcProvider;
 
 /// Fetch all tx receipts for a contiguous range of blocks.
@@ -46,7 +46,7 @@ pub async fn fetch_tx_receipts(
         "fetch_tx_receipts: requesting tx receipts for {count} blocks ({from_block}..={to_block})"
     );
 
-    let semaphore = Arc::new(Semaphore::new(ADAPTIVE_CONCURRENCY.current()));
+    let semaphore = Arc::new(Semaphore::new(SINGLE_BLOCK_ADAPTIVE_CONCURRENCY.current()));
 
     let handles: Vec<_> = block_numbers
         .into_iter()
@@ -59,7 +59,7 @@ pub async fn fetch_tx_receipts(
                     .await
                     .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
 
-                ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                SINGLE_BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
 
                 let result = provider
                     .get_block_receipts(block_num)
@@ -126,7 +126,7 @@ pub(super) async fn fetch_tx_receipts_with_retry(
                         retry.from, retry.to
                     );
                     if retry.backoff {
-                        ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
+                        SINGLE_BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
                     }
                     sub_from = retry.from;
                     max_block_range = retry.max_block_range;

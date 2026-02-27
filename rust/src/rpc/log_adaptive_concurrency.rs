@@ -189,6 +189,7 @@ impl LogAdaptiveConcurrency {
         if rng.random_bool(0.10) {
             let original = self.original_chunk_size.load(Ordering::Relaxed);
             self.chunk_size.store(original, Ordering::Relaxed);
+            info!("log adaptive concurrency: randomly reset chunk size to original {original}");
         }
     }
 }
