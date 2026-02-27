@@ -27,10 +27,8 @@ use crate::convert::{
 use crate::query::{BlockFields, TransactionFields};
 use crate::response::ArrowResponse;
 
-use super::block_adaptive_concurrency::{
-    halved_block_range, is_fatal_error, is_rate_limit_error, retry_block_with_block_range,
-    BLOCK_ADAPTIVE_CONCURRENCY,
-};
+use super::block_adaptive_concurrency::{retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY};
+use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use super::provider::RpcProvider;
 use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
 
@@ -38,7 +36,7 @@ use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
 /// Each chunk of block numbers is sent as a single JSON-RPC batch request.
 pub(crate) const DEFAULT_BLOCK_CHUNK_SIZE: usize = 200;
 
-/// Historical phase for the block pipeline: iterate `[from_block, snapshot]`
+/// Historical phase for the block pipeline: iterate `[from_block, snapshot_latest_block]`
 /// in chunks, fetch blocks (and optionally tx receipts), and send Arrow responses.
 ///
 /// Spawns multiple concurrent fetch tasks via `JoinSet`, bounded by the block

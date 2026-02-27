@@ -3,35 +3,25 @@
 //! Adapted from rindexer's `fetch_logs_stream()` (fetch_logs.rs:30-149) and
 //! `live_indexing_stream()` (fetch_logs.rs:391-711).
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use rand::Rng;
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
 
 use crate::config::ClientConfig;
-use crate::convert::{
-    logs_to_record_batch, select_log_columns,
-    select_trace_columns, traces_to_record_batch,
-};
+use crate::convert::{select_trace_columns, traces_to_record_batch};
 use crate::query::{
-    get_blocks_needs_full_txs, get_trace_method, needs_tx_receipts, LogFields,
-    LogRequest, Query, TraceFields, TraceMethod,
+    get_blocks_needs_full_txs, get_trace_method, needs_tx_receipts,
+    Query, TraceFields, TraceMethod,
 };
 use crate::response::ArrowResponse;
 
-use super::log_adaptive_concurrency::{
-    retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY,
-};
-use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error, is_rate_limit_error};
+use super::log_adaptive_concurrency::retry_logs_with_block_range;
+use super::shared_helpers::{clamp_to_block, halved_block_range, is_fatal_error};
 use super::block_fetcher::{run_block_historical, run_block_live};
-use super::log_fetcher::{fetch_logs, DEFAULT_LOG_CHUNK_SIZE};
+use super::log_fetcher::{run_log_historical, run_log_live};
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces;
 
@@ -109,281 +99,6 @@ async fn run_log_stream(
     Ok(())
 }
 
-/// Historical phase for the log pipeline: iterate `[from_block, snapshot_latest_block]`
-/// in parallel chunks, bounded by `LOG_ADAPTIVE_CONCURRENCY`.
-///
-/// Spawns multiple concurrent fetch tasks via `JoinSet`. Each task fetches a
-/// chunk of logs, converts to Arrow, and returns the response. Results are sent
-/// to the channel as they complete (no ordering guarantee).
-async fn run_log_historical(
-    provider: &RpcProvider,
-    log_requests: &[LogRequest],
-    start_from: u64,
-    snapshot_latest_block: u64,
-    log_fields: LogFields,
-    config: &ClientConfig,
-    tx: &mpsc::Sender<Result<ArrowResponse>>,
-) -> Result<u64> {
-    let original_max_range = config
-        .batch_size
-        .map(|b| (b as u64).min(DEFAULT_LOG_CHUNK_SIZE as u64))
-        .unwrap_or(DEFAULT_LOG_CHUNK_SIZE as u64);
-
-    // Shared chunk size — tasks can shrink it via fetch_min on errors.
-    let chunk_size = Arc::new(AtomicU64::new(original_max_range));
-    let cancel = CancellationToken::new();
-    let mut join_set: JoinSet<(u64, u64, Result<ArrowResponse>)> = JoinSet::new();
-    let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
-
-    // Next unassigned from_block.
-    let mut cursor = start_from;
-
-    loop {
-        // Fill join_set up to the current concurrency limit.
-        let max_concurrent = LOG_ADAPTIVE_CONCURRENCY.current();
-        while join_set.len() < max_concurrent {
-            let (chunk_from, chunk_to) = if let Some((rf, rt)) = retry_queue.pop_front() {
-                // Priority: retry failed ranges first.
-                (rf, rt)
-            } else if cursor <= snapshot_latest_block {
-                // Claim next chunk from cursor.
-                let current_chunk = chunk_size.load(Ordering::Relaxed);
-                let from = cursor;
-                let to = (from + current_chunk - 1).min(snapshot_latest_block);
-                cursor = to + 1;
-                (from, to)
-            } else {
-                // No more work to assign.
-                break;
-            };
-
-            // Spawn a fetch task.
-            let task_provider = provider.clone();
-            let task_cancel = cancel.clone();
-            let task_log_requests: Vec<LogRequest> = log_requests.to_vec();
-
-            join_set.spawn(async move {
-                if task_cancel.is_cancelled() {
-                    return (chunk_from, chunk_to, Err(anyhow::anyhow!("cancelled")));
-                }
-
-                LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-
-                let result = fetch_logs(&task_provider, &task_log_requests, chunk_from, chunk_to)
-                    .await
-                    .map(|logs| {
-                        let logs_batch = select_log_columns(logs_to_record_batch(&logs), &log_fields);
-                        ArrowResponse::with_logs(logs_batch)
-                    });
-
-                (chunk_from, chunk_to, result)
-            });
-        }
-
-        // If no tasks in flight and nothing to assign, we're done.
-        if join_set.is_empty() {
-            break;
-        }
-
-        // Await next completion.
-        let Some(join_result) = join_set.join_next().await else {
-            break;
-        };
-
-        // Handle JoinError (task panic / cancellation).
-        let (chunk_from, chunk_to, task_result) = match join_result {
-            Ok(tuple) => tuple,
-            Err(join_err) => {
-                error!("Log fetch task panicked: {join_err}");
-                cancel.cancel();
-                while join_set.join_next().await.is_some() {}
-                return Err(anyhow::anyhow!("log fetch task panicked: {join_err}"));
-            }
-        };
-
-        match task_result {
-            Ok(response) => {
-                LOG_ADAPTIVE_CONCURRENCY.record_success();
-
-                if tx.send(Ok(response)).await.is_err() {
-                    debug!("Stream consumer dropped, stopping historical log fetch");
-                    cancel.cancel();
-                    while join_set.join_next().await.is_some() {}
-                    return Ok(cursor);
-                }
-
-                // 10% random chance to reset chunk_size to original.
-                let mut rng = rand::rng();
-                if rng.random_bool(0.10) {
-                    chunk_size.store(original_max_range, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                let err_str = format!("{e:#}");
-
-                // 1. Fatal errors — cancel everything and return.
-                if is_fatal_error(&err_str) {
-                    cancel.cancel();
-                    while join_set.join_next().await.is_some() {}
-                    return Err(e);
-                }
-
-                // Cancelled tasks — just drop them.
-                if cancel.is_cancelled() {
-                    continue;
-                }
-
-                // 2. Rate-limit errors — reduce concurrency and backoff, re-queue.
-                if is_rate_limit_error(&err_str) {
-                    LOG_ADAPTIVE_CONCURRENCY.record_rate_limit();
-                    LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-                    retry_queue.push_back((chunk_from, chunk_to));
-                    continue;
-                }
-
-                // 3. Block-range errors — provider-specific parsing, shrink chunk, re-queue.
-                let current_range = Some(chunk_size.load(Ordering::Relaxed));
-                if let Some(retry) =
-                    retry_logs_with_block_range(&err_str, chunk_from, chunk_to, current_range)
-                {
-                    warn!(
-                        "Log range error, re-queuing {}-{} (was {chunk_from}-{chunk_to})",
-                        retry.from, retry.to
-                    );
-                    if let Some(new_max) = retry.max_block_range {
-                        chunk_size.fetch_min(new_max, Ordering::Relaxed);
-                    }
-                    if retry.backoff {
-                        LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-                    }
-                    retry_queue.push_back((retry.from, retry.to));
-                    // Split the remainder into chunks using max_block_range
-                    // (the most conservative safe range) at 90% so each piece
-                    // has a high chance of succeeding on the first try.
-                    if retry.to < chunk_to {
-                        let max_range = retry.max_block_range
-                            .unwrap_or_else(|| retry.to.saturating_sub(retry.from).max(1));
-                        let safe_range = (max_range * 9 / 10).max(1);
-                        let mut rem_from = retry.to + 1;
-                        while rem_from <= chunk_to {
-                            let rem_to = (rem_from + safe_range - 1).min(chunk_to);
-                            retry_queue.push_back((rem_from, rem_to));
-                            rem_from = rem_to + 1;
-                        }
-                    }
-                    continue;
-                }
-
-                // 4. Unknown error — reduce concurrency, halve range and re-queue.
-                LOG_ADAPTIVE_CONCURRENCY.record_error();
-                let halved = halved_block_range(chunk_from, chunk_to);
-                error!(
-                    "Unexpected error fetching logs {chunk_from}-{chunk_to}, \
-                     re-queuing {chunk_from}-{halved}: {err_str}"
-                );
-                let new_range = halved.saturating_sub(chunk_from);
-                chunk_size.fetch_min(new_range, Ordering::Relaxed);
-                retry_queue.push_back((chunk_from, halved));
-                // If there's a remainder after the halved portion, re-queue that too.
-                if halved < chunk_to {
-                    retry_queue.push_back((halved + 1, chunk_to));
-                }
-            }
-        }
-    }
-
-    // Return cursor past the snapshot so the live phase starts correctly.
-    Ok(snapshot_latest_block + 1)
-}
-
-/// Live phase for the log pipeline: poll for new blocks and fetch logs.
-async fn run_log_live(
-    provider: &RpcProvider,
-    log_requests: &[LogRequest],
-    start_from: u64,
-    log_fields: LogFields,
-    config: &ClientConfig,
-    tx: &mpsc::Sender<Result<ArrowResponse>>,
-) -> Result<()> {
-    let poll_interval = Duration::from_millis(config.head_poll_interval_millis);
-    let mut from_block = start_from;
-
-    loop {
-        tokio::time::sleep(poll_interval).await;
-
-        let head = match provider.get_block_number().await {
-            Ok(h) => h,
-            Err(e) => {
-                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
-                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
-                continue;
-            }
-        };
-
-        // Apply reorg-safe distance.
-        let safe_head = head.saturating_sub(config.reorg_safe_distance);
-
-        if from_block > safe_head {
-            debug!("At head (from_block={from_block}, safe_head={safe_head}), waiting...");
-            continue;
-        }
-
-        let to_block = safe_head;
-
-        match fetch_logs(provider, log_requests, from_block, to_block).await {
-            Ok(logs) => {
-                let logs_len = logs.len();
-
-                if logs_len > 0 {
-                    info!("Live: fetched {logs_len} logs between blocks {from_block}-{to_block}");
-                }
-
-                let logs_batch = select_log_columns(logs_to_record_batch(&logs), &log_fields);
-                let response = ArrowResponse::with_logs(logs_batch);
-
-                if tx.send(Ok(response)).await.is_err() {
-                    debug!("Stream consumer dropped, stopping live log polling");
-                    return Ok(());
-                }
-
-                // Advance past the last seen block.
-                if let Some(last_log) = logs.last() {
-                    from_block = last_log.block_number.map_or(to_block + 1, |n| n + 1);
-                } else {
-                    from_block = to_block + 1;
-                }
-            }
-            Err(e) => {
-                let err_str = format!("{e:#}");
-
-                if is_fatal_error(&err_str) {
-                    return Err(e);
-                }
-
-                if is_rate_limit_error(&err_str) {
-                    LOG_ADAPTIVE_CONCURRENCY.record_rate_limit();
-                    LOG_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
-                    continue;
-                }
-
-                if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
-                    debug!(
-                        "Live: block range error, will retry with {}-{}",
-                        retry.from, retry.to
-                    );
-                    // Don't advance — the next iteration will clamp naturally.
-                } else {
-                    LOG_ADAPTIVE_CONCURRENCY.record_error();
-                    error!(
-                        "Live: unexpected error fetching logs {from_block}-{to_block}: {err_str}, retrying in {}ms",
-                        config.retry_backoff_ms
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
-            }
-        }
-    }
-}
 
 // ===========================================================================
 // Block stream (eth_getBlockByNumber pipeline)

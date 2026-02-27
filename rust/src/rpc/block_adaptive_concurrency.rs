@@ -14,7 +14,7 @@ use log::{info, warn};
 use once_cell::sync::Lazy;
 
 use super::shared_helpers::{
-    is_fatal_error_lower, pick_min_range, truncate_and_lowercase,
+    halved_block_range, is_fatal_error_lower, pick_min_range, truncate_and_lowercase,
 };
 
 /// Global adaptive concurrency controller for block pipeline batch calls.
@@ -153,12 +153,6 @@ impl BlockAdaptiveConcurrency {
     }
 }
 
-// ===========================================================================
-// Block range retry
-// ===========================================================================
-
-// Re-export shared helpers used by callers of this module.
-pub use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 
 /// Result of attempting to parse an error for a suggested block range.
 #[derive(Debug)]
