@@ -163,6 +163,32 @@ impl BlockAdaptiveConcurrency {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }
     }
+
+    /// Return the current chunk size (block range per batch call).
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size.load(Ordering::Relaxed)
+    }
+
+    /// Set the original chunk size (from config). Also resets the current
+    /// chunk size if it is larger than the new original.
+    pub fn set_original_chunk_size(&self, size: u64) {
+        self.original_chunk_size.store(size, Ordering::Relaxed);
+        self.chunk_size.fetch_min(size, Ordering::Relaxed);
+    }
+
+    /// Reduce the chunk size to at most `new_max`.
+    pub fn reduce_chunk_size(&self, new_max: u64) {
+        self.chunk_size.fetch_min(new_max, Ordering::Relaxed);
+    }
+
+    /// With a 10% probability, reset chunk size to the original value.
+    pub fn maybe_reset_chunk_size(&self) {
+        let mut rng = rand::rng();
+        if rng.random_bool(0.10) {
+            let original = self.original_chunk_size.load(Ordering::Relaxed);
+            self.chunk_size.store(original, Ordering::Relaxed);
+        }
+    }
 }
 
 
