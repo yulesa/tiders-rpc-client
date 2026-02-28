@@ -17,7 +17,6 @@ use crate::query::{
 };
 use crate::response::ArrowResponse;
 
-use super::log_adaptive_concurrency::retry_logs_with_block_range;
 use super::block_fetcher::{run_block_historical, run_block_live};
 use super::log_fetcher::{run_log_historical, run_log_live};
 use super::provider::RpcProvider;
@@ -339,21 +338,7 @@ async fn run_trace_live(
 
                 from_block = to_block + 1;
             }
-            Err(e) => {
-                let err_str = format!("{e:#}");
-                if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
-                    debug!(
-                        "Live: trace range error, will retry with {}-{}",
-                        retry.from, retry.to
-                    );
-                } else {
-                    error!(
-                        "Live: unexpected error fetching traces {from_block}-{to_block}: {err_str}, retrying in {}ms",
-                        config.retry_backoff_ms
-                    );
-                }
-                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
-            }
+            Err(e) => return Err(e),
         }
     }
 }
