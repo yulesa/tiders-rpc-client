@@ -39,7 +39,7 @@ use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
 use super::trace_fetcher::fetch_traces;
-use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
+use super::tx_receipt_fetcher::fetch_tx_receipts;
 
 /// Spawn a coordinated producer task that runs and all
 /// pipelines requested via `include_*` flags, merging results per
@@ -234,7 +234,7 @@ async fn fetch_all(
         let raw_txs_batch = transactions_to_record_batch(&blocks);
 
         let merged_txs = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-            let receipts = fetch_tx_receipts_with_retry(provider, from_block, to_block, None).await?;
+            let receipts = fetch_tx_receipts(provider, from_block, to_block, config).await?;
             merge_tx_receipts_into_batch(raw_txs_batch, &receipts)
         } else {
             raw_txs_batch

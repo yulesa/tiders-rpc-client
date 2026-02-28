@@ -27,7 +27,7 @@ use crate::response::ArrowResponse;
 use super::block_adaptive_concurrency::{retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY, DEFAULT_BLOCK_CHUNK_SIZE};
 use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use super::provider::RpcProvider;
-use super::tx_receipt_fetcher::fetch_tx_receipts_with_retry;
+use super::tx_receipt_fetcher::fetch_tx_receipts;
 
 /// Historical phase for the block pipeline: iterate `[from_block, snapshot_latest_block]`
 /// in chunks, fetch blocks (and optionally tx receipts), and send Arrow responses.
@@ -87,6 +87,7 @@ pub(super) async fn run_block_historical(
             // Spawn a fetch task.
             let task_provider = provider.clone();
             let task_cancel = cancel.clone();
+            let task_config = config.clone();
 
             join_set.spawn(async move {
                 if task_cancel.is_cancelled() {
@@ -101,7 +102,7 @@ pub(super) async fn run_block_historical(
                     fetch_receipts_flag,
                     &block_fields,
                     &tx_fields,
-                    Some(BLOCK_ADAPTIVE_CONCURRENCY.chunk_size()),
+                    &task_config,
                 )
                 .await;
 
@@ -253,7 +254,7 @@ pub(super) async fn run_block_live(
             fetch_receipts_flag,
             block_fields,
             tx_fields,
-            None,
+            config,
         )
         .await
         {
@@ -307,7 +308,7 @@ async fn run_block_fetch_task(
     fetch_receipts_flag: bool,
     block_fields: &BlockFields,
     tx_fields: &TransactionFields,
-    max_block_range: Option<u64>,
+    config: &ClientConfig,
 ) -> Result<ArrowResponse> {
     BLOCK_ADAPTIVE_CONCURRENCY.wait_for_backoff().await;
 
@@ -318,13 +319,7 @@ async fn run_block_fetch_task(
     let raw_txs_batch = transactions_to_record_batch(&blocks);
 
     let txs_batch = if fetch_receipts_flag && raw_txs_batch.num_rows() > 0 {
-        let tx_receipts = fetch_tx_receipts_with_retry(
-            provider,
-            from_block,
-            to_block,
-            max_block_range,
-        )
-        .await?;
+        let tx_receipts = fetch_tx_receipts(provider, from_block, to_block, config).await?;
         info!(
             "Fetched {} tx receipts for blocks {from_block}-{to_block}",
             tx_receipts.len()
