@@ -385,11 +385,17 @@ fn try_parse_limited_to(
     from_block: u64,
     max_block_range: Option<u64>,
 ) -> Option<RetryBlockRange> {
-    let re = Regex::new(r"limited to a ([\d,.]+)").ok()?;
+    // Matches "limited to a 10,000" or "limited to a 5 range" (QuickNode
+    // discover plan). When the word "range" follows, the number is an
+    // inclusive block count (to - from + 1), so we subtract 1 to get the
+    // exclusive diff used everywhere else.
+    let re = Regex::new(r"limited to a ([\d,.]+)(\s+range)?").ok()?;
     let captures = re.captures(error_lower)?;
     let range_str = captures.get(1)?.as_str().replace(['.', ','], "");
     let range: u64 = range_str.parse().ok()?;
-    let suggested = pick_min_range(max_block_range, range);
+    let is_inclusive = captures.get(2).is_some();
+    let diff = if is_inclusive { range.saturating_sub(1) } else { range };
+    let suggested = pick_min_range(max_block_range, diff);
     Some(RetryBlockRange {
         from: from_block,
         to: from_block + suggested,
@@ -594,6 +600,18 @@ mod tests {
         assert!(r.is_some());
         assert_eq!(r.map(|r| r.from), Some(100));
         assert_eq!(r.map(|r| r.to), Some(10100));
+    }
+
+    #[test]
+    fn quicknode_discover_plan_parsing() {
+        // "eth_getLogs is limited to a 5 range" — inclusive count, so diff = 4.
+        let msg = r#"eth_getLogs failed: HTTP error 413 with body: {"jsonrpc":"2.0","id":525,"error":{"code":-32615,"message":"eth_getLogs is limited to a 5 range, upgrade from discover plan at https://dashboard.quicknode.com/billing/plan to increase the limit"}}"#;
+        let result = retry_logs_with_block_range(msg, 18000078, 18000099, None);
+        let r = result.as_ref();
+        assert!(r.is_some());
+        assert_eq!(r.map(|r| r.from), Some(18000078));
+        assert_eq!(r.map(|r| r.to), Some(18000082)); // from + 4
+        assert_eq!(r.and_then(|r| r.max_block_range), Some(4));
     }
 
     #[test]

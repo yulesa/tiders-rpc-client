@@ -62,7 +62,7 @@ impl AdaptiveConcurrency {
             max,
             consecutive_successes: AtomicUsize::new(0),
             backoff_ms: AtomicU64::new(0),
-            scale_up_threshold: 10,
+            scale_up_threshold: 50,
         }
     }
 
@@ -75,7 +75,7 @@ impl AdaptiveConcurrency {
     ///
     /// - Reduces backoff by 25% (multiply by 3/4).
     /// - After `scale_up_threshold` consecutive successes, increases concurrency
-    ///   by 20%.
+    ///   by 33%.
     pub fn record_success(&self) {
         // Reduce backoff by 25%.
         let old_backoff = self.backoff_ms.load(Ordering::Relaxed);
@@ -95,8 +95,8 @@ impl AdaptiveConcurrency {
             self.consecutive_successes.store(0, Ordering::Relaxed);
 
             let old = self.current.load(Ordering::Relaxed);
-            // +20%, at least +1.
-            let increment = (old / 5).max(1);
+            // +33%, at least +1.
+            let increment = (old / 3).max(1);
             let new = (old + increment).min(self.max);
             self.current.store(new, Ordering::Relaxed);
 
@@ -184,11 +184,11 @@ mod tests {
     #[test]
     fn scale_up_after_threshold() {
         let ac = AdaptiveConcurrency::new(10, 2, 200);
-        for _ in 0..10 {
+        for _ in 0..50 {
             ac.record_success();
         }
-        // 10 + 20% = 12
-        assert_eq!(ac.current(), 12);
+        // 10 + 33% = 13
+        assert_eq!(ac.current(), 13);
     }
 
     #[test]
@@ -217,10 +217,10 @@ mod tests {
     #[test]
     fn respects_maximum() {
         let ac = AdaptiveConcurrency::new(190, 2, 200);
-        for _ in 0..10 {
+        for _ in 0..50 {
             ac.record_success();
         }
-        // 190 + 20% = 228, capped at 200
+        // 190 + 33% = 253, capped at 200
         assert_eq!(ac.current(), 200);
     }
 

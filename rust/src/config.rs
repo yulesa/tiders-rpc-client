@@ -28,7 +28,7 @@ impl ClientConfig {
             retry_backoff_ms: 1000,
             retry_base_ms: 300,
             retry_ceiling_ms: 10_000,
-            req_timeout_millis: 90_000,
+            req_timeout_millis: 30_000,
             compute_units_per_second: None,
             max_concurrent_requests: None,
             batch_size: None,
