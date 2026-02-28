@@ -3,24 +3,18 @@
 //! Adapted from rindexer's `fetch_logs_stream()` (fetch_logs.rs:30-149) and
 //! `live_indexing_stream()` (fetch_logs.rs:391-711).
 
-use std::time::Duration;
-
 use anyhow::{Context, Result};
-use log::{debug, error, info};
+use log::{error, info};
 use tokio::sync::mpsc;
 
 use crate::config::ClientConfig;
-use crate::convert::{select_trace_columns, traces_to_record_batch};
-use crate::query::{
-    get_blocks_needs_full_txs, get_trace_method, needs_tx_receipts,
-    Query, TraceFields, TraceMethod,
-};
+use crate::query::{get_blocks_needs_full_txs, get_trace_method, needs_tx_receipts, Query};
 use crate::response::ArrowResponse;
 
+use super::provider::RpcProvider;
 use super::block_fetcher::{run_block_historical, run_block_live};
 use super::log_fetcher::{run_log_historical, run_log_live};
-use super::provider::RpcProvider;
-use super::trace_fetcher::fetch_traces;
+use super::trace_fetcher::{run_trace_historical, run_trace_live};
 
 // ===========================================================================
 // Log stream (eth_getLogs pipeline)
@@ -247,98 +241,3 @@ async fn run_trace_stream(
     Ok(())
 }
 
-/// Historical phase for the trace pipeline.
-async fn run_trace_historical(
-    provider: &RpcProvider,
-    trace_method: TraceMethod,
-    trace_fields: &TraceFields,
-    start_from: u64,
-    snapshot_latest_block: u64,
-    config: &ClientConfig,
-    tx: &mpsc::Sender<Result<ArrowResponse>>,
-) -> Result<u64> {
-    use super::single_block_adaptive_concurrency::DEFAULT_SINGLE_BLOCK_CHUNK_SIZE;
-
-    let chunk_size = config.batch_size.map(|b| b as u64).unwrap_or(DEFAULT_SINGLE_BLOCK_CHUNK_SIZE);
-    let mut from_block = start_from;
-
-    while from_block <= snapshot_latest_block {
-        let to_block = (from_block + chunk_size - 1).min(snapshot_latest_block);
-
-        debug!("Fetching traces for blocks {from_block}..{to_block}");
-
-        let traces = fetch_traces(provider, from_block, to_block, trace_method, config).await?;
-
-        let num_traces = traces.len();
-        info!("Fetched {num_traces} traces between blocks {from_block}-{to_block}");
-
-        let traces_batch = select_trace_columns(traces_to_record_batch(&traces), trace_fields);
-        let response = ArrowResponse::with_traces(traces_batch);
-
-        if tx.send(Ok(response)).await.is_err() {
-            debug!("Stream consumer dropped, stopping historical trace fetch");
-            return Ok(from_block);
-        }
-
-        from_block = to_block + 1;
-    }
-
-    Ok(from_block)
-}
-
-/// Live phase for the trace pipeline: poll for new blocks.
-async fn run_trace_live(
-    provider: &RpcProvider,
-    trace_method: TraceMethod,
-    trace_fields: &TraceFields,
-    start_from: u64,
-    config: &ClientConfig,
-    tx: &mpsc::Sender<Result<ArrowResponse>>,
-) -> Result<()> {
-    let poll_interval = Duration::from_millis(config.head_poll_interval_millis);
-    let mut from_block = start_from;
-
-    loop {
-        tokio::time::sleep(poll_interval).await;
-
-        let head = match provider.get_block_number().await {
-            Ok(h) => h,
-            Err(e) => {
-                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
-                tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
-                continue;
-            }
-        };
-
-        let safe_head = head.saturating_sub(config.reorg_safe_distance);
-
-        if from_block > safe_head {
-            debug!("At head (from_block={from_block}, safe_head={safe_head}), waiting...");
-            continue;
-        }
-
-        let to_block = safe_head;
-
-        match fetch_traces(provider, from_block, to_block, trace_method, config).await {
-            Ok(traces) => {
-                let num_traces = traces.len();
-
-                if num_traces > 0 {
-                    info!("Live: fetched {num_traces} traces between blocks {from_block}-{to_block}");
-                }
-
-                let traces_batch =
-                    select_trace_columns(traces_to_record_batch(&traces), trace_fields);
-                let response = ArrowResponse::with_traces(traces_batch);
-
-                if tx.send(Ok(response)).await.is_err() {
-                    debug!("Stream consumer dropped, stopping live trace polling");
-                    return Ok(());
-                }
-
-                from_block = to_block + 1;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
