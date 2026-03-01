@@ -17,7 +17,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ClientConfig;
-use crate::convert::{
+use super::arrow_convert::{
     blocks_to_record_batch, merge_tx_receipts_into_batch, select_block_columns,
     select_transaction_columns, transactions_to_record_batch,
 };

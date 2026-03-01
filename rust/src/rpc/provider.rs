@@ -26,6 +26,7 @@ use alloy::{
         layers::RetryBackoffLayer,
     },
 };
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use anyhow::{Context, Result};
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -85,8 +86,16 @@ impl RpcProvider {
 
         let rpc_url = Url::parse(&config.url).context("invalid RPC URL")?;
 
+        let mut headers = HeaderMap::new();
+        if let Some(token) = &config.bearer_token {
+            let value = HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("invalid bearer token")?;
+            headers.insert(AUTHORIZATION, value);
+        }
+
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.req_timeout_millis))
+            .default_headers(headers)
             .build()
             .context("failed to build HTTP client")?;
 

@@ -28,7 +28,7 @@ use super::single_block_adaptive_concurrency::{
 };
 use super::shared_helpers::{is_fatal_error, is_rate_limit_error};
 use crate::config::ClientConfig;
-use crate::convert::{select_trace_columns, traces_to_record_batch};
+use super::arrow_convert::{select_trace_columns, traces_to_record_batch};
 use crate::query::{TraceFields, TraceMethod};
 use crate::response::ArrowResponse;
 

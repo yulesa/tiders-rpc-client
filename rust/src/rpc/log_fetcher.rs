@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY, DEFAULT_LOG_CHUNK_SIZE};
 use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use crate::config::ClientConfig;
-use crate::convert::{logs_to_record_batch, select_log_columns};
+use super::arrow_convert::{logs_to_record_batch, select_log_columns};
 use crate::query::{LogFields, LogRequest};
 use crate::response::ArrowResponse;
 

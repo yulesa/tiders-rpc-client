@@ -1,6 +1,5 @@
 mod client;
 pub mod config;
-mod convert;
 pub mod query;
 mod response;
 mod rpc;
