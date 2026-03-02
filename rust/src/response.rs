@@ -5,8 +5,8 @@ use arrow::record_batch::RecordBatch;
 
 /// A response containing Arrow `RecordBatch`es for each EVM table.
 ///
-/// Each batch uses the canonical `cherry-evm-schema` schemas so the data
-/// can be passed directly into the cherry-core pipeline.
+/// Each batch uses the canonical `tiders-evm-schema` schemas so the data
+/// can be passed directly into the tiders-core pipeline.
 #[derive(Debug, Clone)]
 pub struct ArrowResponse {
     pub blocks: RecordBatch,
@@ -43,10 +43,38 @@ impl ArrowResponse {
     /// Build an empty response (zero rows, correct schemas).
     pub fn empty() -> Self {
         Self {
-            blocks: empty_batch(&cherry_evm_schema::blocks_schema()),
-            transactions: empty_batch(&cherry_evm_schema::transactions_schema()),
-            logs: empty_batch(&cherry_evm_schema::logs_schema()),
-            traces: empty_batch(&cherry_evm_schema::traces_schema()),
+            blocks: empty_batch(&tiders_evm_schema::blocks_schema()),
+            transactions: empty_batch(&tiders_evm_schema::transactions_schema()),
+            logs: empty_batch(&tiders_evm_schema::logs_schema()),
+            traces: empty_batch(&tiders_evm_schema::traces_schema()),
+        }
+    }
+
+    /// Build a response with only the `logs` RecordBatch populated.
+    /// Other tables are empty with correct schemas.
+    pub fn with_logs(logs: RecordBatch) -> Self {
+        Self {
+            logs,
+            ..Self::empty()
+        }
+    }
+
+    /// Build a response with `blocks` and `transactions` populated.
+    /// Other tables (logs, traces) are empty with correct schemas.
+    pub fn with_blocks(blocks: RecordBatch, transactions: RecordBatch) -> Self {
+        Self {
+            blocks,
+            transactions,
+            ..Self::empty()
+        }
+    }
+
+    /// Build a response with only the `traces` RecordBatch populated.
+    /// Other tables are empty with correct schemas.
+    pub fn with_traces(traces: RecordBatch) -> Self {
+        Self {
+            traces,
+            ..Self::empty()
         }
     }
 }
@@ -69,6 +97,7 @@ fn max_block_in_batch(batch: &RecordBatch, col_name: &str) -> Result<Option<u64>
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used)]
 mod tests {
     use std::sync::Arc;
 
@@ -77,7 +106,11 @@ mod tests {
 
     use super::*;
 
-    fn batch_with_block_number(schema: Arc<arrow::datatypes::Schema>, col: &str, num: u64) -> RecordBatch {
+    fn batch_with_block_number(
+        schema: Arc<arrow::datatypes::Schema>,
+        col: &str,
+        num: u64,
+    ) -> RecordBatch {
         let columns: Vec<Arc<dyn arrow::array::Array>> = schema
             .fields()
             .iter()
@@ -96,23 +129,47 @@ mod tests {
     fn arrow_response_empty_and_next_block() {
         // empty: correct schemas, zero rows, next_block = None
         let empty = ArrowResponse::empty();
-        assert_eq!(empty.blocks.schema().as_ref(), &cherry_evm_schema::blocks_schema());
-        assert_eq!(empty.transactions.schema().as_ref(), &cherry_evm_schema::transactions_schema());
-        assert_eq!(empty.logs.schema().as_ref(), &cherry_evm_schema::logs_schema());
-        assert_eq!(empty.traces.schema().as_ref(), &cherry_evm_schema::traces_schema());
+        assert_eq!(
+            empty.blocks.schema().as_ref(),
+            &tiders_evm_schema::blocks_schema()
+        );
+        assert_eq!(
+            empty.transactions.schema().as_ref(),
+            &tiders_evm_schema::transactions_schema()
+        );
+        assert_eq!(
+            empty.logs.schema().as_ref(),
+            &tiders_evm_schema::logs_schema()
+        );
+        assert_eq!(
+            empty.traces.schema().as_ref(),
+            &tiders_evm_schema::traces_schema()
+        );
         assert_eq!(empty.next_block().unwrap(), None);
 
         // blocks only: next_block = max + 1
         let with_blocks = ArrowResponse {
-            blocks: batch_with_block_number(Arc::new(cherry_evm_schema::blocks_schema()), "number", 20),
+            blocks: batch_with_block_number(
+                Arc::new(tiders_evm_schema::blocks_schema()),
+                "number",
+                20,
+            ),
             ..ArrowResponse::empty()
         };
         assert_eq!(with_blocks.next_block().unwrap(), Some(21));
 
         // logs wins over blocks: next_block = logs max + 1
         let with_logs = ArrowResponse {
-            blocks: batch_with_block_number(Arc::new(cherry_evm_schema::blocks_schema()), "number", 10),
-            logs: batch_with_block_number(Arc::new(cherry_evm_schema::logs_schema()), "block_number", 30),
+            blocks: batch_with_block_number(
+                Arc::new(tiders_evm_schema::blocks_schema()),
+                "number",
+                10,
+            ),
+            logs: batch_with_block_number(
+                Arc::new(tiders_evm_schema::logs_schema()),
+                "block_number",
+                30,
+            ),
             ..ArrowResponse::empty()
         };
         assert_eq!(with_logs.next_block().unwrap(), Some(31));
