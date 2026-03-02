@@ -1,6 +1,6 @@
 //! EVM query types for the RPC client.
 //!
-//! These mirror `cherry_ingest::evm::Query` but are owned by this crate
+//! These mirror `tiders_ingest::evm::Query` but are owned by this crate
 //! so the RPC client can evolve independently.
 
 use anyhow::{bail, Result};
@@ -391,7 +391,7 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipelines> {
                      RPC block pipeline. eth_getBlockByNumber returns all transactions in a block \
                      with no server-side filtering — every block in the range is fetched \
                      regardless. Remove the filters and perform them post-indexing in your \
-                     database instead or use a different cherry client that supports filtering data on source.",
+                     database instead or use a different tiders client that supports filtering data on source.",
                     unsupported.join(", ")
                 );
             }
@@ -421,7 +421,7 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipelines> {
                      RPC trace pipeline. trace_block / debug_traceBlockByNumber returns all \
                      traces in a block with no server-side filtering — every block in the range \
                      is fetched regardless. Remove the filters and perform them post-indexing in \
-                     your database instead or use a different cherry client that supports \
+                     your database instead or use a different tiders client that supports \
                      filtering data on source.",
                     unsupported.join(", ")
                 );

@@ -1,6 +1,6 @@
-# cherry-rpc-client
+# tiders-rpc-client
 
-RPC client for fetching EVM blockchain data from any standard JSON-RPC provider into Arrow format, for use with the [cherry](https://github.com/steelcake/cherry) data pipeline framework.
+RPC client for fetching EVM blockchain data from any standard JSON-RPC provider into Arrow format, for use with the [tiders](https://github.com/yulesa/tiders) data pipeline framework.
 
 See [SPECIFICATION.md](SPECIFICATION.md) for the full design specification.
 

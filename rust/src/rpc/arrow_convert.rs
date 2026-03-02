@@ -1,4 +1,4 @@
-//! Convert alloy RPC types to Arrow `RecordBatch` using `cherry_evm_schema` builders.
+//! Convert alloy RPC types to Arrow `RecordBatch` using `tiders_evm_schema` builders.
 
 use std::collections::HashMap;
 
@@ -17,7 +17,7 @@ use arrow::array::{
 };
 use arrow::datatypes::i256;
 use arrow::record_batch::RecordBatch;
-use cherry_evm_schema::{BlocksBuilder, LogsBuilder, TracesBuilder, TransactionsBuilder};
+use tiders_evm_schema::{BlocksBuilder, LogsBuilder, TracesBuilder, TransactionsBuilder};
 
 use crate::query::{BlockFields, LogFields, TraceFields, TransactionFields};
 
@@ -260,7 +260,7 @@ pub fn blocks_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
 }
 
 /// Append one row to the withdrawals list builder.
-fn append_withdrawals(wb: &mut cherry_evm_schema::WithdrawalsBuilder, block: &AnyRpcBlock) {
+fn append_withdrawals(wb: &mut tiders_evm_schema::WithdrawalsBuilder, block: &AnyRpcBlock) {
     let list_builder = &mut wb.0;
 
     if let Some(withdrawals) = &block.inner.withdrawals {
@@ -526,7 +526,7 @@ fn append_y_parity(t: &mut TransactionsBuilder, tx: &alloy::network::AnyRpcTrans
 
 /// Append access_list for the transaction.
 fn append_access_list(
-    al_builder: &mut cherry_evm_schema::AccessListBuilder,
+    al_builder: &mut tiders_evm_schema::AccessListBuilder,
     tx: &alloy::network::AnyRpcTransaction,
 ) {
     let list_builder = &mut al_builder.0;
@@ -1257,14 +1257,14 @@ mod tests {
     fn empty_logs_produce_valid_batch() {
         let batch = logs_to_record_batch(&[]);
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().as_ref(), &cherry_evm_schema::logs_schema());
+        assert_eq!(batch.schema().as_ref(), &tiders_evm_schema::logs_schema());
     }
 
     #[test]
     fn empty_blocks_produce_valid_batch() {
         let batch = blocks_to_record_batch(&[]);
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.schema().as_ref(), &cherry_evm_schema::blocks_schema());
+        assert_eq!(batch.schema().as_ref(), &tiders_evm_schema::blocks_schema());
     }
 
     #[test]
@@ -1273,7 +1273,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(
             batch.schema().as_ref(),
-            &cherry_evm_schema::transactions_schema()
+            &tiders_evm_schema::transactions_schema()
         );
     }
 

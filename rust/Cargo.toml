@@ -1,5 +1,5 @@
 [package]
-name = "cherry-rpc-client"
+name = "tiders-rpc-client"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 alloy = { version = "1.1", features = ["full", "json-rpc"] }
 arrow = "56"
 anyhow = "1"
-cherry-evm-schema = { path = "../../cherry-core/evm-schema" }
+tiders-evm-schema = { path = "../../tiders-core/evm-schema" }
 futures-lite = "2"
 rand = "0.9"
 regex = "1"

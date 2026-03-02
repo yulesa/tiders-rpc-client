@@ -79,7 +79,7 @@ impl Client {
     }
 
     /// Convert an `ArrowResponse` into the `BTreeMap<String, RecordBatch>`
-    /// format expected by the cherry-core ingest pipeline.
+    /// format expected by the tiders-core ingest pipeline.
     pub fn response_to_btree(response: ArrowResponse) -> BTreeMap<String, RecordBatch> {
         let mut map = BTreeMap::new();
         map.insert("blocks".to_owned(), response.blocks);
@@ -108,7 +108,7 @@ mod tests {
         TransactionFields, TransactionRequest,
     };
 
-    /// Root of the cherry-rpc-client repository (one level above `rust/`).
+    /// Root of the tiders-rpc-client repository (one level above `rust/`).
     const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
     /// Tenderly free Ethereum mainnet gateway (same default as rindexer examples).
@@ -204,7 +204,7 @@ mod tests {
             // Every chunk should carry the correct schemas.
             assert_eq!(
                 resp.logs.schema().as_ref(),
-                &cherry_evm_schema::logs_schema(),
+                &tiders_evm_schema::logs_schema(),
             );
 
             // Unimplemented tables stay empty.

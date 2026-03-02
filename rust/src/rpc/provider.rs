@@ -68,17 +68,17 @@ impl RpcProvider {
     pub fn new(config: &ClientConfig) -> Result<Self> {
         // alloy's RetryBackoffLayer uses a single fixed `initial_backoff`; it has
         // no base/ceiling exponential ramp. These fields are kept in ClientConfig
-        // for API compatibility with other cherry clients but are ignored here.
+        // for API compatibility with other tiders clients but are ignored here.
         if config.retry_base_ms != 300 {
             warn!(
-                "retry_base_ms is set but ignored by cherry-rpc-client: alloy's \
+                "retry_base_ms is set but ignored by tiders-rpc-client: alloy's \
                  RetryBackoffLayer does not implement exponential backoff — it uses a \
                  fixed initial_backoff (retry_backoff_ms). Set retry_backoff_ms instead."
             );
         }
         if config.retry_ceiling_ms != 10_000 {
             warn!(
-                "retry_ceiling_ms is set but ignored by cherry-rpc-client: alloy's \
+                "retry_ceiling_ms is set but ignored by tiders-rpc-client: alloy's \
                  RetryBackoffLayer does not implement a backoff ceiling. \
                  Set retry_backoff_ms to control the fixed per-retry delay."
             );
@@ -242,7 +242,7 @@ impl RpcProvider {
                          Either switch to a provider that supports trace_block \
                          (Erigon, Nethermind, Reth, Alchemy, QuickNode) or configure \
                          TraceMethod::DebugTraceBlockByNumber if your provider supports it, \
-                         or use a cherry client that does not rely on RPC calls: \
+                         or use a tiders client that does not rely on RPC calls: \
                            SQD Network, HyperSync\n\
                          Original provider error: {msg}"
                     )
@@ -291,7 +291,7 @@ impl RpcProvider {
                      Either switch to a provider that supports debug_traceBlockByNumber \
                      (Geth, Reth, Erigon, Alchemy, QuickNode, Infura) or configure \
                      TraceMethod::TraceBlock if your provider supports it, \
-                     or use a cherry client that does not rely on RPC calls: \
+                     or use a tiders client that does not rely on RPC calls: \
                        SQD Network, HyperSync\n\
                      Original provider error: {msg}"
                 )
@@ -411,7 +411,7 @@ impl RpcProvider {
                      not implemented because it requires one HTTP request per transaction. \
                      Switch to a provider that supports eth_getBlockReceipts \
                      (Alchemy, QuickNode, Infura, Chainstack, dRPC, Moralis, GetBlock), \
-                     or use a cherry client that does not rely on RPC calls: \
+                     or use a tiders client that does not rely on RPC calls: \
                        SQD Network, HyperSync\n\
                      Original provider error: {msg}"
                 )

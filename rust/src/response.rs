@@ -5,8 +5,8 @@ use arrow::record_batch::RecordBatch;
 
 /// A response containing Arrow `RecordBatch`es for each EVM table.
 ///
-/// Each batch uses the canonical `cherry-evm-schema` schemas so the data
-/// can be passed directly into the cherry-core pipeline.
+/// Each batch uses the canonical `tiders-evm-schema` schemas so the data
+/// can be passed directly into the tiders-core pipeline.
 #[derive(Debug, Clone)]
 pub struct ArrowResponse {
     pub blocks: RecordBatch,
@@ -43,10 +43,10 @@ impl ArrowResponse {
     /// Build an empty response (zero rows, correct schemas).
     pub fn empty() -> Self {
         Self {
-            blocks: empty_batch(&cherry_evm_schema::blocks_schema()),
-            transactions: empty_batch(&cherry_evm_schema::transactions_schema()),
-            logs: empty_batch(&cherry_evm_schema::logs_schema()),
-            traces: empty_batch(&cherry_evm_schema::traces_schema()),
+            blocks: empty_batch(&tiders_evm_schema::blocks_schema()),
+            transactions: empty_batch(&tiders_evm_schema::transactions_schema()),
+            logs: empty_batch(&tiders_evm_schema::logs_schema()),
+            traces: empty_batch(&tiders_evm_schema::traces_schema()),
         }
     }
 
@@ -131,26 +131,26 @@ mod tests {
         let empty = ArrowResponse::empty();
         assert_eq!(
             empty.blocks.schema().as_ref(),
-            &cherry_evm_schema::blocks_schema()
+            &tiders_evm_schema::blocks_schema()
         );
         assert_eq!(
             empty.transactions.schema().as_ref(),
-            &cherry_evm_schema::transactions_schema()
+            &tiders_evm_schema::transactions_schema()
         );
         assert_eq!(
             empty.logs.schema().as_ref(),
-            &cherry_evm_schema::logs_schema()
+            &tiders_evm_schema::logs_schema()
         );
         assert_eq!(
             empty.traces.schema().as_ref(),
-            &cherry_evm_schema::traces_schema()
+            &tiders_evm_schema::traces_schema()
         );
         assert_eq!(empty.next_block().unwrap(), None);
 
         // blocks only: next_block = max + 1
         let with_blocks = ArrowResponse {
             blocks: batch_with_block_number(
-                Arc::new(cherry_evm_schema::blocks_schema()),
+                Arc::new(tiders_evm_schema::blocks_schema()),
                 "number",
                 20,
             ),
@@ -161,12 +161,12 @@ mod tests {
         // logs wins over blocks: next_block = logs max + 1
         let with_logs = ArrowResponse {
             blocks: batch_with_block_number(
-                Arc::new(cherry_evm_schema::blocks_schema()),
+                Arc::new(tiders_evm_schema::blocks_schema()),
                 "number",
                 10,
             ),
             logs: batch_with_block_number(
-                Arc::new(cherry_evm_schema::logs_schema()),
+                Arc::new(tiders_evm_schema::logs_schema()),
                 "block_number",
                 30,
             ),
