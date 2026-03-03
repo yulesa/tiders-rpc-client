@@ -83,7 +83,8 @@ async fn run_coordinated_stream(
         None => provider
             .get_block_number()
             .await
-            .context("failed to get current block number for snapshot_latest_block")?,
+            .context("failed to get current block number for snapshot_latest_block")?
+            .saturating_sub(config.reorg_safe_distance),
     };
 
     let next_block = run_coordinated_historical(

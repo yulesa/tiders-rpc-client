@@ -113,7 +113,7 @@ mod tests {
     const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
     /// Tenderly free Ethereum mainnet gateway (same default as rindexer examples).
-    /// To run the traces test, you will need to get a free tenderly API key and 
+    /// To run the traces test, you will need to get a free tenderly API key and
     /// set the RPC URL, e.g. `https://mainnet.gateway.tenderly.co/your_key_here`.
     const RPC_URL: &str = "https://mainnet.gateway.tenderly.co/";
 
@@ -248,7 +248,7 @@ mod tests {
     }
 
     /// Streaming query: fetches the last 100 blocks up to the current head
-    /// via the block fetcher pipeline (`eth_getBlockByNumber`)and their 
+    /// via the block fetcher pipeline (`eth_getBlockByNumber`)and their
     /// transaction receipts via `eth_getBlockReceipts` and saves
     /// blocks and transactions to Parquet.
     /// Run with: cargo test stream_blocks_and_transactions -- --nocapture
@@ -262,6 +262,7 @@ mod tests {
         let client = Client::new(ClientConfig {
             stop_on_head: true,
             batch_size: Some(10),
+            reorg_safe_distance: 10,
             ..ClientConfig::new(RPC_URL.to_owned())
         })
         .unwrap_or_else(|e| panic!("Failed to create client: {e}"));
@@ -277,7 +278,7 @@ mod tests {
 
         let query = Query {
             from_block,
-            to_block: Some(latest_block),
+            to_block: None,
             include_all_blocks: true,
             logs: Vec::new(),
             transactions: vec![TransactionRequest {
@@ -451,13 +452,13 @@ mod tests {
                     ..LogFields::default()
                 },
                 trace: TraceFields {
-                //     block_number: true,
-                //     transaction_hash: true,
-                //     from: true,
-                //     to: true,
-                //     value: true,
-                //     call_type: true,
-                //     gas_used: true,
+                    //     block_number: true,
+                    //     transaction_hash: true,
+                    //     from: true,
+                    //     to: true,
+                    //     value: true,
+                    //     call_type: true,
+                    //     gas_used: true,
                     ..TraceFields::default()
                 },
             },
@@ -516,7 +517,7 @@ mod tests {
 
     /// Streaming query: fetches the last 20 blocks via the trace pipeline
     /// (`trace_block`) and saves traces to Parquet.
-    /// To run the traces test, you will need to get a free tenderly API key and 
+    /// To run the traces test, you will need to get a free tenderly API key and
     /// set the RPC URL, e.g. `https://mainnet.gateway.tenderly.co/your_key_here`
     /// Run with: cargo test stream_traces -- --nocapturecargo test stream_traces -- --nocapture
     #[tokio::test]
@@ -607,21 +608,16 @@ mod tests {
             all_responses.push(resp);
         }
 
-        assert!(
-            total_trace_rows > 0,
-            "should have yielded trace rows"
-        );
+        assert!(total_trace_rows > 0, "should have yielded trace rows");
         assert!(chunk_count > 0, "should have yielded at least one chunk");
 
         log::info!("Streamed {total_trace_rows} trace rows in {chunk_count} chunks");
 
         let root = Path::new(REPO_ROOT);
-        for (name, extract) in [
-            (
-                "traces",
-                (|r: &ArrowResponse| r.traces.clone()) as fn(&ArrowResponse) -> RecordBatch,
-            ),
-        ] {
+        for (name, extract) in [(
+            "traces",
+            (|r: &ArrowResponse| r.traces.clone()) as fn(&ArrowResponse) -> RecordBatch,
+        )] {
             let batches: Vec<RecordBatch> = all_responses.iter().map(extract).collect();
             let path = root.join(format!("data/trace_stream_{name}.parquet"));
             write_parquet(&path, &batches);

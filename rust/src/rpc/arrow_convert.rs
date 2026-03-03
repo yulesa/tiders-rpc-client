@@ -339,10 +339,7 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
                     // max_fee_per_gas is only present on EIP-1559+ txs. For
                     // legacy txs gas_price is Some while max_priority_fee is None.
                     let gas_price = TransactionTrait::gas_price(tx);
-                    if gas_price.is_none() {
-                        t.max_fee_per_gas
-                            .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
-                    } else if tx.max_priority_fee_per_gas().is_some() {
+                    if gas_price.is_none() || tx.max_priority_fee_per_gas().is_some() {
                         t.max_fee_per_gas
                             .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
                     } else {

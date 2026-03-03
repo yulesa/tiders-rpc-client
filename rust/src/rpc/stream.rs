@@ -57,7 +57,8 @@ async fn run_log_stream(
         None => provider
             .get_block_number()
             .await
-            .context("failed to get current block number for snapshot_latest_block")?,
+            .context("failed to get current block number for snapshot_latest_block")?
+            .saturating_sub(config.reorg_safe_distance),
     };
 
     // Historical phase
@@ -128,7 +129,8 @@ async fn run_block_stream(
         None => provider
             .get_block_number()
             .await
-            .context("failed to get current block number for snapshot_latest_block")?,
+            .context("failed to get current block number for snapshot_latest_block")?
+            .saturating_sub(config.reorg_safe_distance),
     };
 
     let include_txs = get_blocks_needs_full_txs(&query);
@@ -206,7 +208,8 @@ async fn run_trace_stream(
         None => provider
             .get_block_number()
             .await
-            .context("failed to get current block number for snapshot_latest_block")?,
+            .context("failed to get current block number for snapshot_latest_block")?
+            .saturating_sub(config.reorg_safe_distance),
     };
 
     let trace_method = config

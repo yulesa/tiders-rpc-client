@@ -239,4 +239,3 @@ pub fn retry_block_with_block_range(
 
     None
 }
-
