@@ -59,12 +59,7 @@ impl Client {
                 "Starting multi-pipeline stream (blocks_transactions={}, logs={}, traces={})",
                 pipelines.blocks_transactions, pipelines.logs, pipelines.traces
             );
-            start_coordinated_stream(
-                self.provider.clone(),
-                query,
-                config,
-                pipelines,
-            )
+            start_coordinated_stream(self.provider.clone(), query, config, pipelines)
         } else if pipelines.logs {
             info!("Starting log stream");
             start_log_stream(self.provider.clone(), query, self.config.clone())

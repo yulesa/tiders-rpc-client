@@ -15,8 +15,8 @@ use alloy::{
         client::RpcClient,
         types::{
             trace::parity::{
-                Action, CallAction, CallOutput, CallType, LocalizedTransactionTrace,
-                TraceOutput, TransactionTrace,
+                Action, CallAction, CallOutput, CallType, LocalizedTransactionTrace, TraceOutput,
+                TransactionTrace,
             },
             BlockId, BlockNumberOrTag, Filter, Log,
         },
@@ -26,9 +26,9 @@ use alloy::{
         layers::RetryBackoffLayer,
     },
 };
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use anyhow::{Context, Result};
 use log::warn;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
@@ -179,15 +179,12 @@ impl RpcProvider {
                 ));
             }
             Ok(Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "eth_getBlockByNumber batch failed: {e}"
-                ));
+                return Err(anyhow::anyhow!("eth_getBlockByNumber batch failed: {e}"));
             }
             Ok(Ok(())) => {}
         }
 
-        let mut results: Vec<Option<AnyRpcBlock>> =
-            Vec::with_capacity(request_futures.len());
+        let mut results: Vec<Option<AnyRpcBlock>> = Vec::with_capacity(request_futures.len());
         for f in request_futures {
             let block = f
                 .await
@@ -220,10 +217,7 @@ impl RpcProvider {
     /// Call `trace_block(N)` via the alloy trace API.
     ///
     /// Adapted from rindexer's `trace_block()` (provider.rs:357-368).
-    async fn trace_block(
-        &self,
-        block_number: u64,
-    ) -> Result<Vec<LocalizedTransactionTrace>> {
+    async fn trace_block(&self, block_number: u64) -> Result<Vec<LocalizedTransactionTrace>> {
         self.provider
             .trace_block(BlockId::Number(BlockNumberOrTag::Number(block_number)))
             .await
@@ -310,14 +304,20 @@ impl RpcProvider {
             // Push the top-level call (without its nested calls).
             flattened.push(TraceCallFrame {
                 tx_hash: frame.tx_hash,
-                result: TraceCall { calls: vec![], ..frame.result.clone() },
+                result: TraceCall {
+                    calls: vec![],
+                    ..frame.result.clone()
+                },
             });
             // Stack-based DFS to flatten nested calls.
             let mut stack = frame.result.calls;
             while let Some(call) = stack.pop() {
                 flattened.push(TraceCallFrame {
                     tx_hash: None,
-                    result: TraceCall { calls: vec![], ..call.clone() },
+                    result: TraceCall {
+                        calls: vec![],
+                        ..call.clone()
+                    },
                 });
                 stack.extend(call.calls);
             }
@@ -419,7 +419,7 @@ impl RpcProvider {
                 anyhow::anyhow!("eth_getBlockReceipts failed for block {block_number}: {msg}")
             }
         })
-        .map(|opt| opt.unwrap_or_default())
+        .map(std::option::Option::unwrap_or_default)
     }
 }
 

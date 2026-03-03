@@ -11,9 +11,9 @@ use crate::config::ClientConfig;
 use crate::query::{get_blocks_needs_full_txs, get_trace_method, needs_tx_receipts, Query};
 use crate::response::ArrowResponse;
 
-use super::provider::RpcProvider;
 use super::block_fetcher::{run_block_historical, run_block_live};
 use super::log_fetcher::{run_log_historical, run_log_live};
+use super::provider::RpcProvider;
 use super::trace_fetcher::{run_trace_historical, run_trace_live};
 
 // ===========================================================================
@@ -89,7 +89,6 @@ async fn run_log_stream(
 
     Ok(())
 }
-
 
 // ===========================================================================
 // Block stream (eth_getBlockByNumber pipeline)
@@ -210,7 +209,9 @@ async fn run_trace_stream(
             .context("failed to get current block number for snapshot_latest_block")?,
     };
 
-    let trace_method = config.trace_method.unwrap_or_else(|| get_trace_method(&query));
+    let trace_method = config
+        .trace_method
+        .unwrap_or_else(|| get_trace_method(&query));
     let trace_fields = query.fields.trace;
 
     let next_block = run_trace_historical(
@@ -240,4 +241,3 @@ async fn run_trace_stream(
 
     Ok(())
 }
-

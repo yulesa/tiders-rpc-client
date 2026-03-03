@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use log::{debug, info, warn};
-use once_cell::sync::Lazy;
 use rand::Rng;
 use regex::Regex;
+use std::sync::LazyLock;
 
 use super::shared_helpers::{
     halved_block_range, is_fatal_error_lower, pick_min_range, truncate_and_lowercase,
@@ -26,7 +26,7 @@ use super::shared_helpers::{
 pub const DEFAULT_LOG_CHUNK_SIZE: u64 = 1000;
 
 /// Global adaptive concurrency controller for log pipeline batch calls.
-pub static LOG_ADAPTIVE_CONCURRENCY: Lazy<LogAdaptiveConcurrency> = Lazy::new(|| {
+pub static LOG_ADAPTIVE_CONCURRENCY: LazyLock<LogAdaptiveConcurrency> = LazyLock::new(|| {
     LogAdaptiveConcurrency::new(
         10,  // initial concurrent calls
         2,   // minimum
@@ -394,7 +394,11 @@ fn try_parse_limited_to(
     let range_str = captures.get(1)?.as_str().replace(['.', ','], "");
     let range: u64 = range_str.parse().ok()?;
     let is_inclusive = captures.get(2).is_some();
-    let diff = if is_inclusive { range.saturating_sub(1) } else { range };
+    let diff = if is_inclusive {
+        range.saturating_sub(1)
+    } else {
+        range
+    };
     let suggested = pick_min_range(max_block_range, diff);
     Some(RetryBlockRange {
         from: from_block,
@@ -497,8 +501,8 @@ impl FallbackBlockRange {
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests {
-    use super::*;
     use super::super::shared_helpers::is_fatal_error;
+    use super::*;
 
     #[test]
     fn scale_up_after_threshold() {

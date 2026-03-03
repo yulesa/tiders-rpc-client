@@ -4,7 +4,7 @@
 //! so the RPC client can evolve independently.
 
 use anyhow::{bail, Result};
-use log::{warn};
+use log::warn;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Address(pub [u8; 20]);
@@ -238,8 +238,8 @@ pub(crate) struct Pipelines {
 
 impl Pipelines {
     /// Returns `true` if more than one pipeline is needed, requiring coordination.
-    pub fn needs_coordinator(&self) -> bool {
-        (self.blocks_transactions as u8 + self.logs as u8 + self.traces as u8) > 1
+    pub fn needs_coordinator(self) -> bool {
+        (u8::from(self.blocks_transactions) + u8::from(self.logs) + u8::from(self.traces)) > 1
     }
 }
 
@@ -304,7 +304,7 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipelines> {
     // opted in via `include_*` flags. Without those flags, a query that
     // touches multiple pipelines is an error.
     let pipeline_count =
-        uses_log_pipeline as u8 + uses_block_pipeline as u8 + uses_trace_pipeline as u8;
+        u8::from(uses_log_pipeline) + u8::from(uses_block_pipeline) + u8::from(uses_trace_pipeline);
     if pipeline_count > 1 && !has_cross_pipeline {
         let mut pipelines = Vec::new();
         if uses_log_pipeline {
@@ -340,11 +340,21 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipelines> {
                 || req.include_blocks;
             if has_include {
                 let mut filters: Vec<&str> = Vec::new();
-                if !req.address.is_empty() { filters.push("address"); }
-                if !req.topic0.is_empty() { filters.push("topic0"); }
-                if !req.topic1.is_empty() { filters.push("topic1"); }
-                if !req.topic2.is_empty() { filters.push("topic2"); }
-                if !req.topic3.is_empty() { filters.push("topic3"); }
+                if !req.address.is_empty() {
+                    filters.push("address");
+                }
+                if !req.topic0.is_empty() {
+                    filters.push("topic0");
+                }
+                if !req.topic1.is_empty() {
+                    filters.push("topic1");
+                }
+                if !req.topic2.is_empty() {
+                    filters.push("topic2");
+                }
+                if !req.topic3.is_empty() {
+                    filters.push("topic3");
+                }
                 if !filters.is_empty() {
                     bail!(
                         "logs[{i}] sets both include_* flags ({}) and field filters [{}]. \
@@ -376,12 +386,24 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipelines> {
     if !query.transactions.is_empty() {
         for (i, req) in query.transactions.iter().enumerate() {
             let mut unsupported: Vec<&str> = Vec::new();
-            if !req.from_.is_empty() { unsupported.push("from_"); }
-            if !req.to.is_empty() { unsupported.push("to"); }
-            if !req.sighash.is_empty() { unsupported.push("sighash"); }
-            if !req.type_.is_empty() { unsupported.push("type_"); }
-            if !req.hash.is_empty() { unsupported.push("hash"); }
-            if !req.status.is_empty() { unsupported.push("status"); }
+            if !req.from_.is_empty() {
+                unsupported.push("from_");
+            }
+            if !req.to.is_empty() {
+                unsupported.push("to");
+            }
+            if !req.sighash.is_empty() {
+                unsupported.push("sighash");
+            }
+            if !req.type_.is_empty() {
+                unsupported.push("type_");
+            }
+            if !req.hash.is_empty() {
+                unsupported.push("hash");
+            }
+            if !req.status.is_empty() {
+                unsupported.push("status");
+            }
             if !req.contract_deployment_address.is_empty() {
                 unsupported.push("contract_deployment_address");
             }
@@ -407,14 +429,30 @@ pub(crate) fn analyze_query(query: &Query) -> Result<Pipelines> {
     if !query.traces.is_empty() {
         for (i, req) in query.traces.iter().enumerate() {
             let mut unsupported: Vec<&str> = Vec::new();
-            if !req.from_.is_empty() { unsupported.push("from_"); }
-            if !req.to.is_empty() { unsupported.push("to"); }
-            if !req.address.is_empty() { unsupported.push("address"); }
-            if !req.call_type.is_empty() { unsupported.push("call_type"); }
-            if !req.reward_type.is_empty() { unsupported.push("reward_type"); }
-            if !req.type_.is_empty() { unsupported.push("type_"); }
-            if !req.sighash.is_empty() { unsupported.push("sighash"); }
-            if !req.author.is_empty() { unsupported.push("author"); }
+            if !req.from_.is_empty() {
+                unsupported.push("from_");
+            }
+            if !req.to.is_empty() {
+                unsupported.push("to");
+            }
+            if !req.address.is_empty() {
+                unsupported.push("address");
+            }
+            if !req.call_type.is_empty() {
+                unsupported.push("call_type");
+            }
+            if !req.reward_type.is_empty() {
+                unsupported.push("reward_type");
+            }
+            if !req.type_.is_empty() {
+                unsupported.push("type_");
+            }
+            if !req.sighash.is_empty() {
+                unsupported.push("sighash");
+            }
+            if !req.author.is_empty() {
+                unsupported.push("author");
+            }
             if !unsupported.is_empty() {
                 bail!(
                     "traces[{i}] sets filter fields [{}] which are not supported by the \
@@ -451,46 +489,147 @@ pub(crate) fn get_trace_method(query: &Query) -> TraceMethod {
 
 fn has_any_log_field(f: &LogFields) -> bool {
     any_field_set!(
-        f, removed, log_index, transaction_index, transaction_hash, block_hash, block_number,
-        address, data, topic0, topic1, topic2, topic3,
+        f,
+        removed,
+        log_index,
+        transaction_index,
+        transaction_hash,
+        block_hash,
+        block_number,
+        address,
+        data,
+        topic0,
+        topic1,
+        topic2,
+        topic3,
     )
 }
 
 fn has_any_block_field(f: &BlockFields) -> bool {
     any_field_set!(
-        f, number, hash, parent_hash, nonce, sha3_uncles, logs_bloom, transactions_root,
-        state_root, receipts_root, miner, difficulty, total_difficulty, extra_data, size,
-        gas_limit, gas_used, timestamp, uncles, base_fee_per_gas, blob_gas_used,
-        excess_blob_gas, parent_beacon_block_root, withdrawals_root, withdrawals,
-        l1_block_number, send_count, send_root, mix_hash,
+        f,
+        number,
+        hash,
+        parent_hash,
+        nonce,
+        sha3_uncles,
+        logs_bloom,
+        transactions_root,
+        state_root,
+        receipts_root,
+        miner,
+        difficulty,
+        total_difficulty,
+        extra_data,
+        size,
+        gas_limit,
+        gas_used,
+        timestamp,
+        uncles,
+        base_fee_per_gas,
+        blob_gas_used,
+        excess_blob_gas,
+        parent_beacon_block_root,
+        withdrawals_root,
+        withdrawals,
+        l1_block_number,
+        send_count,
+        send_root,
+        mix_hash,
     )
 }
 
 fn has_any_transaction_field(f: &TransactionFields) -> bool {
     any_field_set!(
-        f, block_hash, block_number, from, gas, gas_price, hash, input, nonce, to,
-        transaction_index, value, v, r, s, max_priority_fee_per_gas, max_fee_per_gas, chain_id,
-        cumulative_gas_used, effective_gas_price, gas_used, contract_address, logs_bloom, type_,
-        root, status, sighash, y_parity, access_list, l1_fee, l1_gas_price, l1_fee_scalar,
-        gas_used_for_l1, max_fee_per_blob_gas, blob_versioned_hashes, deposit_nonce,
-        blob_gas_price, deposit_receipt_version, blob_gas_used, l1_base_fee_scalar,
-        l1_blob_base_fee, l1_blob_base_fee_scalar, l1_block_number, mint, source_hash,
+        f,
+        block_hash,
+        block_number,
+        from,
+        gas,
+        gas_price,
+        hash,
+        input,
+        nonce,
+        to,
+        transaction_index,
+        value,
+        v,
+        r,
+        s,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        chain_id,
+        cumulative_gas_used,
+        effective_gas_price,
+        gas_used,
+        contract_address,
+        logs_bloom,
+        type_,
+        root,
+        status,
+        sighash,
+        y_parity,
+        access_list,
+        l1_fee,
+        l1_gas_price,
+        l1_fee_scalar,
+        gas_used_for_l1,
+        max_fee_per_blob_gas,
+        blob_versioned_hashes,
+        deposit_nonce,
+        blob_gas_price,
+        deposit_receipt_version,
+        blob_gas_used,
+        l1_base_fee_scalar,
+        l1_blob_base_fee,
+        l1_blob_base_fee_scalar,
+        l1_block_number,
+        mint,
+        source_hash,
     )
 }
 
 fn has_any_tx_receipt_field(f: &TransactionFields) -> bool {
     any_field_set!(
-        f, cumulative_gas_used, effective_gas_price, gas_used,
-        contract_address, logs_bloom, root, status,
+        f,
+        cumulative_gas_used,
+        effective_gas_price,
+        gas_used,
+        contract_address,
+        logs_bloom,
+        root,
+        status,
     )
 }
 
 fn has_any_trace_field(f: &TraceFields) -> bool {
     any_field_set!(
-        f, from, to, call_type, gas, input, init, value, author, reward_type,
-        block_hash, block_number, address, code, gas_used, output, subtraces,
-        trace_address, transaction_hash, transaction_position, type_, error,
-        sighash, action_address, balance, refund_address,
+        f,
+        from,
+        to,
+        call_type,
+        gas,
+        input,
+        init,
+        value,
+        author,
+        reward_type,
+        block_hash,
+        block_number,
+        address,
+        code,
+        gas_used,
+        output,
+        subtraces,
+        trace_address,
+        transaction_hash,
+        transaction_position,
+        type_,
+        error,
+        sighash,
+        action_address,
+        balance,
+        refund_address,
     )
 }
 
@@ -499,13 +638,50 @@ fn has_any_trace_field(f: &TraceFields) -> bool {
 /// Used to determine whether `eth_getBlockByNumber` must be called with `include_txs=true`.
 fn has_tx_fields_except_hash(f: &TransactionFields) -> bool {
     any_field_set!(
-        f, block_hash, block_number, from, gas, gas_price, input, nonce, to,
-        transaction_index, value, v, r, s, max_priority_fee_per_gas, max_fee_per_gas, chain_id,
-        cumulative_gas_used, effective_gas_price, gas_used, contract_address, logs_bloom, type_,
-        root, status, sighash, y_parity, access_list, l1_fee, l1_gas_price, l1_fee_scalar,
-        gas_used_for_l1, max_fee_per_blob_gas, blob_versioned_hashes, deposit_nonce,
-        blob_gas_price, deposit_receipt_version, blob_gas_used, l1_base_fee_scalar,
-        l1_blob_base_fee, l1_blob_base_fee_scalar, l1_block_number, mint, source_hash,
+        f,
+        block_hash,
+        block_number,
+        from,
+        gas,
+        gas_price,
+        input,
+        nonce,
+        to,
+        transaction_index,
+        value,
+        v,
+        r,
+        s,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
+        chain_id,
+        cumulative_gas_used,
+        effective_gas_price,
+        gas_used,
+        contract_address,
+        logs_bloom,
+        type_,
+        root,
+        status,
+        sighash,
+        y_parity,
+        access_list,
+        l1_fee,
+        l1_gas_price,
+        l1_fee_scalar,
+        gas_used_for_l1,
+        max_fee_per_blob_gas,
+        blob_versioned_hashes,
+        deposit_nonce,
+        blob_gas_price,
+        deposit_receipt_version,
+        blob_gas_used,
+        l1_base_fee_scalar,
+        l1_blob_base_fee,
+        l1_blob_base_fee_scalar,
+        l1_block_number,
+        mint,
+        source_hash,
     )
 }
 
@@ -529,15 +705,27 @@ mod tests {
     use super::*;
 
     fn log_query(logs: Vec<LogRequest>, fields: Fields) -> Query {
-        Query { logs, fields, ..Query::default() }
+        Query {
+            logs,
+            fields,
+            ..Query::default()
+        }
     }
 
     fn block_query(transactions: Vec<TransactionRequest>, fields: Fields) -> Query {
-        Query { transactions, fields, ..Query::default() }
+        Query {
+            transactions,
+            fields,
+            ..Query::default()
+        }
     }
 
     fn trace_query(traces: Vec<TraceRequest>, fields: Fields) -> Query {
-        Query { traces, fields, ..Query::default() }
+        Query {
+            traces,
+            fields,
+            ..Query::default()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -567,10 +755,16 @@ mod tests {
     #[test]
     fn block_pipeline_when_block_fields_set() {
         let fields = Fields {
-            block: BlockFields { number: true, ..BlockFields::default() },
+            block: BlockFields {
+                number: true,
+                ..BlockFields::default()
+            },
             ..Fields::default()
         };
-        let q = Query { fields, ..Query::default() };
+        let q = Query {
+            fields,
+            ..Query::default()
+        };
         let p = analyze_query(&q).unwrap();
         assert!(p.blocks_transactions);
         assert!(!p.needs_coordinator());
@@ -592,7 +786,10 @@ mod tests {
 
     #[test]
     fn log_include_transactions_triggers_coordinator() {
-        let req = LogRequest { include_transactions: true, ..LogRequest::default() };
+        let req = LogRequest {
+            include_transactions: true,
+            ..LogRequest::default()
+        };
         let q = log_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.logs);
@@ -603,7 +800,10 @@ mod tests {
 
     #[test]
     fn log_include_blocks_triggers_coordinator() {
-        let req = LogRequest { include_blocks: true, ..LogRequest::default() };
+        let req = LogRequest {
+            include_blocks: true,
+            ..LogRequest::default()
+        };
         let q = log_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.logs);
@@ -613,7 +813,10 @@ mod tests {
 
     #[test]
     fn log_include_traces_triggers_coordinator() {
-        let req = LogRequest { include_transaction_traces: true, ..LogRequest::default() };
+        let req = LogRequest {
+            include_transaction_traces: true,
+            ..LogRequest::default()
+        };
         let q = log_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.logs);
@@ -623,7 +826,10 @@ mod tests {
 
     #[test]
     fn transaction_include_logs_triggers_coordinator() {
-        let req = TransactionRequest { include_logs: true, ..TransactionRequest::default() };
+        let req = TransactionRequest {
+            include_logs: true,
+            ..TransactionRequest::default()
+        };
         let q = block_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.blocks_transactions);
@@ -633,7 +839,10 @@ mod tests {
 
     #[test]
     fn transaction_include_traces_triggers_coordinator() {
-        let req = TransactionRequest { include_traces: true, ..TransactionRequest::default() };
+        let req = TransactionRequest {
+            include_traces: true,
+            ..TransactionRequest::default()
+        };
         let q = block_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.blocks_transactions);
@@ -644,7 +853,10 @@ mod tests {
     #[test]
     fn transaction_include_blocks_does_not_trigger_coordinator() {
         // Blocks and transactions are the same pipeline — no coordination needed.
-        let req = TransactionRequest { include_blocks: true, ..TransactionRequest::default() };
+        let req = TransactionRequest {
+            include_blocks: true,
+            ..TransactionRequest::default()
+        };
         let q = block_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.blocks_transactions);
@@ -653,7 +865,10 @@ mod tests {
 
     #[test]
     fn trace_include_transactions_triggers_coordinator() {
-        let req = TraceRequest { include_transactions: true, ..TraceRequest::default() };
+        let req = TraceRequest {
+            include_transactions: true,
+            ..TraceRequest::default()
+        };
         let q = trace_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.traces);
@@ -663,7 +878,10 @@ mod tests {
 
     #[test]
     fn trace_include_blocks_triggers_coordinator() {
-        let req = TraceRequest { include_blocks: true, ..TraceRequest::default() };
+        let req = TraceRequest {
+            include_blocks: true,
+            ..TraceRequest::default()
+        };
         let q = trace_query(vec![req], Fields::default());
         let p = analyze_query(&q).unwrap();
         assert!(p.traces);
@@ -679,11 +897,20 @@ mod tests {
     fn cross_pipeline_error_without_include_flags() {
         // Log fields + block fields without any include_* flag → error.
         let fields = Fields {
-            log: LogFields { block_number: true, ..LogFields::default() },
-            block: BlockFields { number: true, ..BlockFields::default() },
+            log: LogFields {
+                block_number: true,
+                ..LogFields::default()
+            },
+            block: BlockFields {
+                number: true,
+                ..BlockFields::default()
+            },
             ..Fields::default()
         };
-        let q = Query { fields, ..Query::default() };
+        let q = Query {
+            fields,
+            ..Query::default()
+        };
         assert!(
             analyze_query(&q).is_err(),
             "should error when mixing log and block fields without include_* flags"
@@ -693,11 +920,20 @@ mod tests {
     #[test]
     fn cross_pipeline_log_and_trace_fields_without_include_flags_errors() {
         let fields = Fields {
-            log: LogFields { block_number: true, ..LogFields::default() },
-            trace: TraceFields { from: true, ..TraceFields::default() },
+            log: LogFields {
+                block_number: true,
+                ..LogFields::default()
+            },
+            trace: TraceFields {
+                from: true,
+                ..TraceFields::default()
+            },
             ..Fields::default()
         };
-        let q = Query { fields, ..Query::default() };
+        let q = Query {
+            fields,
+            ..Query::default()
+        };
         assert!(analyze_query(&q).is_err());
     }
 
@@ -707,7 +943,10 @@ mod tests {
 
     #[test]
     fn log_include_with_empty_filters_ok() {
-        let req = LogRequest { include_transactions: true, ..LogRequest::default() };
+        let req = LogRequest {
+            include_transactions: true,
+            ..LogRequest::default()
+        };
         let q = log_query(vec![req], Fields::default());
         // Should succeed (no filters set).
         assert!(analyze_query(&q).is_ok());
@@ -773,7 +1012,10 @@ mod tests {
     fn transaction_request_with_include_and_no_filters_ok() {
         // include_logs on a TransactionRequest should be fine — existing filter
         // validation already guards against filter fields.
-        let req = TransactionRequest { include_logs: true, ..TransactionRequest::default() };
+        let req = TransactionRequest {
+            include_logs: true,
+            ..TransactionRequest::default()
+        };
         let q = block_query(vec![req], Fields::default());
         assert!(analyze_query(&q).is_ok());
     }
