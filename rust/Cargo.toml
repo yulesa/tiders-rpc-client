@@ -7,7 +7,7 @@ edition = "2021"
 alloy = { version = "1.1", features = ["full", "json-rpc"] }
 arrow = "56"
 anyhow = "1"
-tiders-evm-schema = { path = "../../tiders-core/evm-schema" }
+tiders-evm-schema = "0.1"
 futures-lite = "2"
 rand = "0.9"
 regex = "1"
