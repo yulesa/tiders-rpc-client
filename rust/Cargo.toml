@@ -2,6 +2,11 @@
 name = "tiders-rpc-client"
 version = "0.1.0"
 edition = "2021"
+description = "A tiders RPC client for fetching EVM blockchain data from any standard JSON-RPC provider"
+homepage = "https://github.com/yulesa/tiders-rpc-client"
+repository = "https://github.com/yulesa/tiders-rpc-clienthttps://github.com/yulesa/tiders-core"
+authors = ["Yule <yulesa@gmail.com>"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 alloy = { version = "1.1", features = ["full", "json-rpc"] }
