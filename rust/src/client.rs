@@ -106,14 +106,16 @@ mod tests {
     use crate::config::ClientConfig;
     use crate::query::{
         Address, BlockFields, Fields, LogFields, LogRequest, Query, Topic, TraceFields,
-        TransactionFields, TransactionRequest,
+        TraceRequest, TransactionFields, TransactionRequest,
     };
 
     /// Root of the tiders-rpc-client repository (one level above `rust/`).
     const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
     /// Tenderly free Ethereum mainnet gateway (same default as rindexer examples).
-    const RPC_URL: &str = "https://mainnet.gateway.tenderly.co";
+    /// To run the traces test, you will need to get a free tenderly API key and 
+    /// set the RPC URL, e.g. `https://mainnet.gateway.tenderly.co/your_key_here`.
+    const RPC_URL: &str = "https://mainnet.gateway.tenderly.co/";
 
     fn make_client() -> Client {
         Client::new(ClientConfig {
@@ -126,6 +128,7 @@ mod tests {
 
     /// Streaming query: fetches the last 5000 blocks up to the current head
     /// (`stop_on_head: true`) and saves all log chunks to Parquet.
+    /// Run with: cargo test stream_reth_transfer_logs -- --nocapture
     #[tokio::test]
     async fn stream_reth_transfer_logs() {
         // Initialise env_logger so log output is visible when running
@@ -245,15 +248,23 @@ mod tests {
     }
 
     /// Streaming query: fetches the last 100 blocks up to the current head
-    /// via the block fetcher pipeline (`eth_getBlockByNumber`) and saves
+    /// via the block fetcher pipeline (`eth_getBlockByNumber`)and their 
+    /// transaction receipts via `eth_getBlockReceipts` and saves
     /// blocks and transactions to Parquet.
+    /// Run with: cargo test stream_blocks_and_transactions -- --nocapture
     #[tokio::test]
     async fn stream_blocks_and_transactions() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Info)
             .parse_default_env()
             .try_init();
-        let client = make_client();
+
+        let client = Client::new(ClientConfig {
+            stop_on_head: true,
+            batch_size: Some(10),
+            ..ClientConfig::new(RPC_URL.to_owned())
+        })
+        .unwrap_or_else(|e| panic!("Failed to create client: {e}"));
 
         let latest_block = client
             .provider
@@ -262,7 +273,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to get block number: {e}"));
         log::info!("Latest block: {latest_block}");
 
-        let from_block = latest_block.saturating_sub(10);
+        let from_block = latest_block.saturating_sub(20);
 
         let query = Query {
             from_block,
@@ -286,6 +297,13 @@ mod tests {
                 },
                 transaction: TransactionFields {
                     hash: true,
+                    // Receipt-only fields:
+                    gas_used: true,
+                    status: true,
+                    effective_gas_price: true,
+                    cumulative_gas_used: true,
+                    contract_address: true,
+                    logs_bloom: true,
                     ..TransactionFields::default()
                 },
                 log: LogFields::default(),
@@ -319,7 +337,7 @@ mod tests {
             // Transactions batch should contain exactly the requested fields.
             let tx_schema = resp.transactions.schema();
             assert!(tx_schema.field_with_name("hash").is_ok());
-            assert_eq!(tx_schema.fields().len(), 1);
+            assert_eq!(tx_schema.fields().len(), 7);
 
             // Log and trace tables should be empty for the block pipeline.
             assert_eq!(resp.logs.num_rows(), 0);
@@ -362,19 +380,23 @@ mod tests {
         }
     }
 
-    /// Streaming query: fetches blocks and their transaction receipts via
-    /// `eth_getBlockReceipts` and saves all chunks to Parquet.
-    ///
-    /// Verifies that receipt-only columns (`gas_used`, `status`,
-    /// `effective_gas_price`, `cumulative_gas_used`, `contract_address`,
-    /// `logs_bloom`) are present and non-empty in the transaction batch.
+    /// Multi-pipeline streaming query: fetches 100 blocks in 10-block batches
+    /// via the coordinated stream, exercising blocks, transactions (with
+    /// receipts), logs, and traces simultaneously.
+    /// Run with: cargo test stream_multi_pipeline -- --nocapture
     #[tokio::test]
-    async fn stream_blocks_with_receipts() {
+    async fn stream_multi_pipeline() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Info)
             .parse_default_env()
             .try_init();
-        let client = make_client();
+
+        let client = Client::new(ClientConfig {
+            stop_on_head: true,
+            batch_size: Some(10),
+            ..ClientConfig::new(RPC_URL.to_owned())
+        })
+        .unwrap_or_else(|e| panic!("Failed to create client: {e}"));
 
         let latest_block = client
             .provider
@@ -383,15 +405,18 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to get block number: {e}"));
         log::info!("Latest block: {latest_block}");
 
-        // Use a small range so the test runs quickly.
-        let from_block = latest_block.saturating_sub(5);
+        let from_block = latest_block.saturating_sub(30);
 
         let query = Query {
             from_block,
             to_block: Some(latest_block),
             include_all_blocks: true,
             logs: Vec::new(),
+            // TransactionRequest with include_logs + include_traces triggers
+            // the coordinated multi-pipeline stream.
             transactions: vec![TransactionRequest {
+                include_logs: true,
+                // include_traces: true,
                 ..TransactionRequest::default()
             }],
             traces: Vec::new(),
@@ -400,23 +425,41 @@ mod tests {
                     number: true,
                     hash: true,
                     timestamp: true,
+                    gas_used: true,
+                    gas_limit: true,
+                    base_fee_per_gas: true,
+                    miner: true,
                     ..BlockFields::default()
                 },
                 transaction: TransactionFields {
                     hash: true,
                     from: true,
                     to: true,
-                    // Receipt-only fields:
+                    value: true,
+                    // Receipt fields:
                     gas_used: true,
                     status: true,
                     effective_gas_price: true,
-                    cumulative_gas_used: true,
-                    contract_address: true,
-                    logs_bloom: true,
                     ..TransactionFields::default()
                 },
-                log: LogFields::default(),
-                trace: TraceFields::default(),
+                log: LogFields {
+                    block_number: true,
+                    transaction_hash: true,
+                    address: true,
+                    topic0: true,
+                    data: true,
+                    ..LogFields::default()
+                },
+                trace: TraceFields {
+                //     block_number: true,
+                //     transaction_hash: true,
+                //     from: true,
+                //     to: true,
+                //     value: true,
+                //     call_type: true,
+                //     gas_used: true,
+                    ..TraceFields::default()
+                },
             },
         };
 
@@ -424,42 +467,38 @@ mod tests {
             .stream(query)
             .unwrap_or_else(|e| panic!("stream creation failed: {e}"));
 
+        let mut total_block_rows = 0u64;
         let mut total_tx_rows = 0u64;
+        let mut total_log_rows = 0u64;
+        let mut chunk_count = 0u64;
         let mut all_responses: Vec<ArrowResponse> = Vec::new();
 
         while let Some(result) = stream.next().await {
             let resp = result.unwrap_or_else(|e| panic!("stream chunk failed: {e}"));
 
-            // Receipt-only columns must be present in the schema.
-            let tx_schema = resp.transactions.schema();
-            assert!(
-                tx_schema.field_with_name("gas_used").is_ok(),
-                "gas_used column missing"
-            );
-            assert!(
-                tx_schema.field_with_name("status").is_ok(),
-                "status column missing"
-            );
-            assert!(
-                tx_schema.field_with_name("effective_gas_price").is_ok(),
-                "effective_gas_price column missing"
-            );
-            assert!(
-                tx_schema.field_with_name("cumulative_gas_used").is_ok(),
-                "cumulative_gas_used column missing"
-            );
+            // All four tables must carry correct field counts.
+            assert_eq!(resp.blocks.schema().fields().len(), 7);
+            assert_eq!(resp.transactions.schema().fields().len(), 7);
+            assert_eq!(resp.logs.schema().fields().len(), 5);
 
+            total_block_rows += resp.blocks.num_rows() as u64;
             total_tx_rows += resp.transactions.num_rows() as u64;
+            total_log_rows += resp.logs.num_rows() as u64;
+            chunk_count += 1;
             all_responses.push(resp);
         }
 
-        assert!(
-            total_tx_rows > 0,
-            "stream should have yielded transaction rows with receipt data"
+        assert!(total_block_rows > 0, "should have yielded block rows");
+        assert!(total_tx_rows > 0, "should have yielded transaction rows");
+        assert!(total_log_rows > 0, "should have yielded log rows");
+        assert!(chunk_count > 0, "should have yielded at least one chunk");
+
+        log::info!(
+            "Multi-pipeline: {total_block_rows} blocks, {total_tx_rows} txs, \
+             {total_log_rows} logs, in {chunk_count} chunks"
         );
 
-        log::info!("Streamed {total_tx_rows} tx rows with receipt data");
-
+        // Save all streamed chunks to parquet files.
         let root = Path::new(REPO_ROOT);
         for (name, extract) in [
             (
@@ -467,18 +506,140 @@ mod tests {
                 (|r: &ArrowResponse| r.blocks.clone()) as fn(&ArrowResponse) -> RecordBatch,
             ),
             ("transactions", |r| r.transactions.clone()),
+            ("logs", |r| r.logs.clone()),
         ] {
             let batches: Vec<RecordBatch> = all_responses.iter().map(extract).collect();
-            let path = root.join(format!("data/receipt_stream_{name}.parquet"));
+            let path = root.join(format!("data/multi_pipeline_{name}.parquet"));
             write_parquet(&path, &batches);
         }
     }
 
+    /// Streaming query: fetches the last 20 blocks via the trace pipeline
+    /// (`trace_block`) and saves traces to Parquet.
+    /// To run the traces test, you will need to get a free tenderly API key and 
+    /// set the RPC URL, e.g. `https://mainnet.gateway.tenderly.co/your_key_here`
+    /// Run with: cargo test stream_traces -- --nocapturecargo test stream_traces -- --nocapture
+    #[tokio::test]
+    async fn stream_traces() {
+        let _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Info)
+            .parse_default_env()
+            .try_init();
+
+        let client = Client::new(ClientConfig {
+            stop_on_head: true,
+            batch_size: Some(5),
+            ..ClientConfig::new(RPC_URL.to_owned())
+        })
+        .unwrap_or_else(|e| panic!("Failed to create client: {e}"));
+
+        let latest_block = client
+            .provider
+            .get_block_number()
+            .await
+            .unwrap_or_else(|e| panic!("failed to get block number: {e}"));
+        log::info!("Latest block: {latest_block}");
+
+        let from_block = latest_block.saturating_sub(10);
+
+        let query = Query {
+            from_block,
+            to_block: Some(latest_block),
+            include_all_blocks: false,
+            logs: Vec::new(),
+            transactions: Vec::new(),
+            traces: vec![TraceRequest {
+                ..TraceRequest::default()
+            }],
+            fields: Fields {
+                block: BlockFields::default(),
+                transaction: TransactionFields::default(),
+                log: LogFields::default(),
+                trace: TraceFields {
+                    block_number: true,
+                    transaction_hash: true,
+                    from: true,
+                    to: true,
+                    value: true,
+                    call_type: true,
+                    gas: true,
+                    gas_used: true,
+                    input: true,
+                    output: true,
+                    subtraces: true,
+                    trace_address: true,
+                    type_: true,
+                    error: true,
+                    ..TraceFields::default()
+                },
+            },
+        };
+
+        let mut stream = client
+            .stream(query)
+            .unwrap_or_else(|e| panic!("stream creation failed: {e}"));
+
+        let mut total_trace_rows = 0u64;
+        let mut chunk_count = 0u64;
+        let mut all_responses: Vec<ArrowResponse> = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            let resp = result.unwrap_or_else(|e| panic!("stream chunk failed: {e}"));
+
+            // Trace schema should contain exactly the requested fields.
+            let trace_schema = resp.traces.schema();
+            assert!(trace_schema.field_with_name("block_number").is_ok());
+            assert!(trace_schema.field_with_name("transaction_hash").is_ok());
+            assert!(trace_schema.field_with_name("from").is_ok());
+            assert!(trace_schema.field_with_name("to").is_ok());
+            assert!(trace_schema.field_with_name("call_type").is_ok());
+            assert!(trace_schema.field_with_name("gas_used").is_ok());
+            assert!(trace_schema.field_with_name("type").is_ok());
+            assert_eq!(trace_schema.fields().len(), 14);
+
+            // Block, transaction, and log tables should be empty for trace-only pipeline.
+            assert_eq!(resp.blocks.num_rows(), 0);
+            assert_eq!(resp.transactions.num_rows(), 0);
+            assert_eq!(resp.logs.num_rows(), 0);
+
+            total_trace_rows += resp.traces.num_rows() as u64;
+            chunk_count += 1;
+            all_responses.push(resp);
+        }
+
+        assert!(
+            total_trace_rows > 0,
+            "should have yielded trace rows"
+        );
+        assert!(chunk_count > 0, "should have yielded at least one chunk");
+
+        log::info!("Streamed {total_trace_rows} trace rows in {chunk_count} chunks");
+
+        let root = Path::new(REPO_ROOT);
+        for (name, extract) in [
+            (
+                "traces",
+                (|r: &ArrowResponse| r.traces.clone()) as fn(&ArrowResponse) -> RecordBatch,
+            ),
+        ] {
+            let batches: Vec<RecordBatch> = all_responses.iter().map(extract).collect();
+            let path = root.join(format!("data/trace_stream_{name}.parquet"));
+            write_parquet(&path, &batches);
+        }
+    }
+
+    // helper function to write a sequence of RecordBatches to a Parquet file,
+    // used to inspect streamed data in tests. Recommend using a vscode extension
+    // like "Parquet Viewer" to open the resulting files.
     fn write_parquet(path: &Path, batches: &[RecordBatch]) {
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return;
         }
         let schema = batches[0].schema();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("create dir {}: {e}", parent.display()));
+        }
         let file = File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
         let mut writer = ArrowWriter::try_new(file, schema, None)
             .unwrap_or_else(|e| panic!("ArrowWriter::try_new: {e}"));
