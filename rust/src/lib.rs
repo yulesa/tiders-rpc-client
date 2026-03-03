@@ -1,3 +1,9 @@
+//! RPC client for fetching EVM blockchain data from JSON-RPC providers
+//! and converting it into Apache Arrow format.
+//!
+//! Designed for use with the [tiders](https://github.com/yulesa/tiders)
+//! data pipeline framework.
+
 mod client;
 pub mod config;
 pub mod query;

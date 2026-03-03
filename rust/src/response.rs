@@ -9,9 +9,13 @@ use arrow::record_batch::RecordBatch;
 /// can be passed directly into the tiders-core pipeline.
 #[derive(Debug, Clone)]
 pub struct ArrowResponse {
+    /// Block header rows.
     pub blocks: RecordBatch,
+    /// Transaction rows (may include receipt data if requested).
     pub transactions: RecordBatch,
+    /// Event log rows.
     pub logs: RecordBatch,
+    /// Execution trace rows.
     pub traces: RecordBatch,
 }
 
@@ -127,7 +131,6 @@ mod tests {
 
     #[test]
     fn arrow_response_empty_and_next_block() {
-        // empty: correct schemas, zero rows, next_block = None
         let empty = ArrowResponse::empty();
         assert_eq!(
             empty.blocks.schema().as_ref(),
@@ -147,7 +150,6 @@ mod tests {
         );
         assert_eq!(empty.next_block().unwrap(), None);
 
-        // blocks only: next_block = max + 1
         let with_blocks = ArrowResponse {
             blocks: batch_with_block_number(
                 Arc::new(tiders_evm_schema::blocks_schema()),
@@ -158,7 +160,6 @@ mod tests {
         };
         assert_eq!(with_blocks.next_block().unwrap(), Some(21));
 
-        // logs wins over blocks: next_block = logs max + 1
         let with_logs = ArrowResponse {
             blocks: batch_with_block_number(
                 Arc::new(tiders_evm_schema::blocks_schema()),
