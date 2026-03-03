@@ -6,29 +6,53 @@
 use anyhow::{bail, Result};
 use log::warn;
 
+/// A 20-byte Ethereum address.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Address(pub [u8; 20]);
 
+/// A 32-byte log topic value.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Topic(pub [u8; 32]);
 
+/// A 4-byte function selector (first 4 bytes of the keccak-256 hash of the function signature).
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Sighash(pub [u8; 4]);
 
+/// A 32-byte hash (e.g. transaction hash, block hash).
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Hash(pub [u8; 32]);
 
+/// Describes what data to fetch from the RPC provider.
+///
+/// A query specifies a block range, which EVM tables to populate (logs,
+/// transactions, traces), and which fields to include in each table.
 #[derive(Default, Debug, Clone)]
 pub struct Query {
+    /// First block to fetch (inclusive).
     pub from_block: u64,
+    /// Last block to fetch (inclusive). `None` means stream up to the current head.
     pub to_block: Option<u64>,
+    /// When `true`, fetch block headers even if no log/transaction/trace
+    /// request is present.
     pub include_all_blocks: bool,
+    /// Log filter requests. Each entry produces separate `eth_getLogs` calls
+    /// and results are merged.
     pub logs: Vec<LogRequest>,
+    /// Transaction requests. Presence triggers the block pipeline
+    /// (`eth_getBlockByNumber`).
     pub transactions: Vec<TransactionRequest>,
+    /// Trace requests. Presence triggers the trace pipeline
+    /// (`trace_block` or `debug_traceBlockByNumber`).
     pub traces: Vec<TraceRequest>,
+    /// Controls which columns appear in the output Arrow batches.
     pub fields: Fields,
 }
 
+/// Filters for the `eth_getLogs` pipeline.
+///
+/// Multiple addresses and topics are OR'd together by the provider.
+/// Use `include_*` flags to request cross-pipeline data (blocks,
+/// transactions, traces) for the same block range.
 #[derive(Default, Debug, Clone)]
 pub struct LogRequest {
     pub address: Vec<Address>,
@@ -36,12 +60,21 @@ pub struct LogRequest {
     pub topic1: Vec<Topic>,
     pub topic2: Vec<Topic>,
     pub topic3: Vec<Topic>,
+    /// Also fetch transactions for the same block range.
     pub include_transactions: bool,
+    /// Ignored by the RPC client (log filters are not allowed in cross-pipeline queries).
     pub include_transaction_logs: bool,
+    /// Also fetch traces for the same block range.
     pub include_transaction_traces: bool,
+    /// Also fetch block headers for the same block range.
     pub include_blocks: bool,
 }
 
+/// Request for the block pipeline (`eth_getBlockByNumber`).
+///
+/// Filter fields (`from_`, `to`, `sighash`, etc.) are **not supported** by the
+/// RPC client — the provider returns all transactions per block. Populate
+/// these only if using a tiders client that supports server-side filtering.
 #[derive(Default, Debug, Clone)]
 pub struct TransactionRequest {
     pub from_: Vec<Address>,
@@ -51,11 +84,19 @@ pub struct TransactionRequest {
     pub type_: Vec<u8>,
     pub contract_deployment_address: Vec<Address>,
     pub hash: Vec<Hash>,
+    /// Also fetch logs for the same block range.
     pub include_logs: bool,
+    /// Also fetch traces for the same block range.
     pub include_traces: bool,
+    /// Included for API compatibility; blocks are always fetched by this pipeline.
     pub include_blocks: bool,
 }
 
+/// Request for the trace pipeline (`trace_block` / `debug_traceBlockByNumber`).
+///
+/// Filter fields (`from_`, `to`, `call_type`, etc.) are **not supported** by
+/// the RPC client — the provider returns all traces per block. Populate
+/// these only if using a tiders client that supports server-side filtering.
 #[derive(Default, Debug, Clone)]
 pub struct TraceRequest {
     pub from_: Vec<Address>,
@@ -66,20 +107,29 @@ pub struct TraceRequest {
     pub type_: Vec<String>,
     pub sighash: Vec<Sighash>,
     pub author: Vec<Address>,
+    /// Which RPC method to use for fetching traces.
     pub trace_method: TraceMethod,
+    /// Also fetch transactions for the same block range.
     pub include_transactions: bool,
+    /// Also fetch logs for the same block range.
     pub include_transaction_logs: bool,
+    /// Also fetch traces for the same block range (no-op since traces are already fetched).
     pub include_transaction_traces: bool,
+    /// Also fetch block headers for the same block range.
     pub include_blocks: bool,
 }
 
+/// Which RPC method to use for fetching execution traces.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum TraceMethod {
+    /// Parity-style `trace_block` (Erigon, Nethermind, Reth).
     #[default]
     TraceBlock,
+    /// Geth-style `debug_traceBlockByNumber` with `callTracer`.
     DebugTraceBlockByNumber,
 }
 
+/// Column selection for each EVM table in the output.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Fields {
     pub block: BlockFields,
@@ -88,6 +138,9 @@ pub struct Fields {
     pub trace: TraceFields,
 }
 
+/// Boolean flags selecting which block columns to include in the output.
+///
+/// When all flags are `false` (the default), the full schema is returned.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct BlockFields {
     pub number: bool,
@@ -120,6 +173,9 @@ pub struct BlockFields {
     pub mix_hash: bool,
 }
 
+/// Boolean flags selecting which transaction columns to include in the output.
+///
+/// When all flags are `false` (the default), the full schema is returned.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct TransactionFields {
     pub block_hash: bool,
@@ -168,6 +224,9 @@ pub struct TransactionFields {
     pub source_hash: bool,
 }
 
+/// Boolean flags selecting which log columns to include in the output.
+///
+/// When all flags are `false` (the default), the full schema is returned.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct LogFields {
     pub removed: bool,
@@ -184,6 +243,9 @@ pub struct LogFields {
     pub topic3: bool,
 }
 
+/// Boolean flags selecting which trace columns to include in the output.
+///
+/// When all flags are `false` (the default), the full schema is returned.
 #[derive(Default, Debug, Clone, Copy)]
 pub struct TraceFields {
     pub from: bool,

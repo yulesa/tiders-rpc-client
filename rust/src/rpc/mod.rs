@@ -1,3 +1,6 @@
+//! RPC pipeline implementations: fetching, adaptive concurrency, Arrow conversion,
+//! and streaming for blocks, logs, traces, and coordinated multi-pipeline queries.
+
 pub(crate) mod arrow_convert;
 pub(crate) mod block_adaptive_concurrency;
 pub(crate) mod block_fetcher;

@@ -82,51 +82,41 @@ pub fn logs_to_record_batch(logs: &[Log]) -> RecordBatch {
     let mut builder = LogsBuilder::default();
 
     for log in logs {
-        // removed
         builder.removed.append_value(log.removed);
 
-        // log_index
         if let Some(idx) = log.log_index {
             builder.log_index.append_value(idx);
         } else {
             builder.log_index.append_null();
         }
 
-        // transaction_index
         if let Some(idx) = log.transaction_index {
             builder.transaction_index.append_value(idx);
         } else {
             builder.transaction_index.append_null();
         }
 
-        // transaction_hash
         if let Some(hash) = log.transaction_hash {
             builder.transaction_hash.append_value(hash.as_slice());
         } else {
             builder.transaction_hash.append_null();
         }
 
-        // block_hash
         if let Some(hash) = log.block_hash {
             builder.block_hash.append_value(hash.as_slice());
         } else {
             builder.block_hash.append_null();
         }
 
-        // block_number
         if let Some(num) = log.block_number {
             builder.block_number.append_value(num);
         } else {
             builder.block_number.append_null();
         }
 
-        // address (always present)
         builder.address.append_value(log.address().as_slice());
-
-        // data
         builder.data.append_value(log.data().data.as_ref());
 
-        // topics: topic0-3
         let topics = log.data().topics();
         append_topic(&mut builder.topic0, topics.first());
         append_topic(&mut builder.topic1, topics.get(1));
@@ -159,98 +149,51 @@ pub fn blocks_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
     for block in blocks {
         let hdr = &block.inner.header.inner;
 
-        // number (u64)
         b.number.append_value(hdr.number);
-
-        // hash (Binary) — from the RPC wrapper, not the consensus header
+        // hash comes from the RPC wrapper, not the consensus header.
         b.hash.append_value(block.inner.header.hash.as_slice());
-
-        // parent_hash
         b.parent_hash.append_value(hdr.parent_hash.as_slice());
 
-        // nonce (B64 → Binary, optional on AnyHeader)
         match hdr.nonce {
             Some(nonce) => b.nonce.append_value(nonce.as_slice()),
             None => b.nonce.append_null(),
         }
 
-        // sha3_uncles (ommers_hash)
         b.sha3_uncles.append_value(hdr.ommers_hash.as_slice());
-
-        // logs_bloom
         b.logs_bloom.append_value(hdr.logs_bloom.as_slice());
-
-        // transactions_root
         b.transactions_root
             .append_value(hdr.transactions_root.as_slice());
-
-        // state_root
         b.state_root.append_value(hdr.state_root.as_slice());
-
-        // receipts_root
         b.receipts_root.append_value(hdr.receipts_root.as_slice());
-
-        // miner (beneficiary)
         b.miner.append_value(hdr.beneficiary.as_slice());
-
-        // difficulty (U256 → Decimal256)
         b.difficulty.append_value(u256_to_i256(hdr.difficulty));
-
-        // total_difficulty (Option<U256>)
         append_optional_u256(&mut b.total_difficulty, block.inner.header.total_difficulty);
-
-        // extra_data
         b.extra_data.append_value(hdr.extra_data.as_ref());
-
-        // size (Option<U256>)
         append_optional_u256(&mut b.size, block.inner.header.size);
-
-        // gas_limit (u64 → Decimal256)
         b.gas_limit.append_value(u64_to_i256(hdr.gas_limit));
-
-        // gas_used (u64 → Decimal256)
         b.gas_used.append_value(u64_to_i256(hdr.gas_used));
-
-        // timestamp (u64 → Decimal256)
         b.timestamp.append_value(u64_to_i256(hdr.timestamp));
 
-        // uncles (List<Binary>)
         for uncle in &block.inner.uncles {
             b.uncles.values().append_value(uncle.as_slice());
         }
         b.uncles.append(true);
 
-        // base_fee_per_gas (Option<u64> → Decimal256)
         append_optional_u64_decimal(&mut b.base_fee_per_gas, hdr.base_fee_per_gas);
-
-        // blob_gas_used (Option<u64> → Decimal256)
         append_optional_u64_decimal(&mut b.blob_gas_used, hdr.blob_gas_used);
-
-        // excess_blob_gas (Option<u64> → Decimal256)
         append_optional_u64_decimal(&mut b.excess_blob_gas, hdr.excess_blob_gas);
-
-        // parent_beacon_block_root (Option<B256>)
         append_optional_b256(
             &mut b.parent_beacon_block_root,
             hdr.parent_beacon_block_root,
         );
-
-        // withdrawals_root (Option<B256>)
         append_optional_b256(&mut b.withdrawals_root, hdr.withdrawals_root);
-
-        // withdrawals (Option<Withdrawals>)
         append_withdrawals(&mut b.withdrawals, block);
 
-        // l1_block_number — not available from standard RPC, null
+        // l1/Arbitrum fields — not available from standard RPC.
         b.l1_block_number.append_null();
-
-        // send_count — not available from standard RPC, null
         b.send_count.append_null();
-
-        // send_root — not available from standard RPC, null
         b.send_root.append_null();
 
-        // mix_hash (Option<B256>)
         append_optional_b256(&mut b.mix_hash, hdr.mix_hash);
     }
 
@@ -365,77 +308,50 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
             BlockTransactions::Uncle => {}
             BlockTransactions::Full(txns) => {
                 for tx in txns {
-                    // block_hash
                     t.block_hash.append_value(block_hash.as_slice());
-
-                    // block_number
                     t.block_number.append_value(block_number);
-
-                    // from (sender)
                     t.from
                         .append_value(TransactionResponse::from(tx).as_slice());
-
-                    // gas (gas_limit: u64 → Decimal256)
                     t.gas.append_value(u64_to_i256(tx.gas_limit()));
-
-                    // gas_price (Option<u128>) — use the Transaction trait version
                     append_optional_u128(&mut t.gas_price, TransactionTrait::gas_price(tx));
-
-                    // hash
                     t.hash.append_value(tx.tx_hash().as_slice());
-
-                    // input
                     t.input.append_value(tx.input().as_ref());
-
-                    // nonce (u64 → Decimal256)
                     t.nonce.append_value(u64_to_i256(tx.nonce()));
 
-                    // to (TxKind: Create → null, Call(addr) → addr)
                     match TransactionTrait::to(tx) {
                         Some(addr) => t.to.append_value(addr.as_slice()),
                         None => t.to.append_null(),
                     }
 
-                    // transaction_index
                     if let Some(idx) = tx.transaction_index() {
                         t.transaction_index.append_value(idx);
                     } else {
                         t.transaction_index.append_null();
                     }
 
-                    // value (U256 → Decimal256)
                     t.value.append_value(u256_to_i256(tx.value()));
-
-                    // Signature fields
                     append_signature_fields(&mut t, tx);
-
-                    // max_priority_fee_per_gas (Option<u128>)
                     append_optional_u128(
                         &mut t.max_priority_fee_per_gas,
                         tx.max_priority_fee_per_gas(),
                     );
 
-                    // max_fee_per_gas — only present on EIP-1559+ txs.
-                    // The consensus trait returns u128 unconditionally; for legacy txs
-                    // gas_price is Some while max_priority_fee_per_gas is None.
+                    // max_fee_per_gas is only present on EIP-1559+ txs. For
+                    // legacy txs gas_price is Some while max_priority_fee is None.
                     let gas_price = TransactionTrait::gas_price(tx);
                     if gas_price.is_none() {
-                        // EIP-1559+ transaction (no legacy gas_price)
                         t.max_fee_per_gas
                             .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
                     } else if tx.max_priority_fee_per_gas().is_some() {
-                        // Has both gas_price and max_priority — EIP-1559 where
-                        // gas_price is filled as effective_gas_price by the RPC.
                         t.max_fee_per_gas
                             .append_value(u128_to_i256(TransactionTrait::max_fee_per_gas(tx)));
                     } else {
                         t.max_fee_per_gas.append_null();
                     }
 
-                    // chain_id (Option<u64> → Decimal256)
                     append_optional_u64_decimal(&mut t.chain_id, tx.chain_id());
 
-                    // Receipt-only fields — null until receipt pipeline is implemented
+                    // Receipt-only fields — filled later by merge_tx_receipts_into_batch.
                     t.cumulative_gas_used.append_null();
                     t.effective_gas_price.append_null();
                     t.gas_used.append_null();
@@ -444,10 +360,8 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
                     t.root.append_null();
                     t.status.append_null();
 
-                    // type (tx type byte)
                     t.type_.append_value(Typed2718::ty(tx));
 
-                    // sighash (first 4 bytes of input, or null if input < 4 bytes)
                     let input = tx.input();
                     if input.len() >= 4 {
                         t.sighash.append_value(&input[..4]);
@@ -455,16 +369,10 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
                         t.sighash.append_null();
                     }
 
-                    // y_parity
                     append_y_parity(&mut t, tx);
-
-                    // access_list
                     append_access_list(&mut t.access_list, tx);
-
-                    // max_fee_per_blob_gas (Option<u128>)
                     append_optional_u128(&mut t.max_fee_per_blob_gas, tx.max_fee_per_blob_gas());
 
-                    // blob_versioned_hashes
                     if let Some(hashes) = tx.blob_versioned_hashes() {
                         for h in hashes {
                             t.blob_versioned_hashes.values().append_value(h.as_slice());
@@ -474,7 +382,6 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
                         t.blob_versioned_hashes.append(false);
                     }
 
-                    // L1/OP fields — decoded from WithOtherFields if present
                     append_op_fields(&mut t, tx);
                 }
             }
@@ -489,21 +396,14 @@ pub fn transactions_to_record_batch(blocks: &[AnyRpcBlock]) -> RecordBatch {
 /// For `AnyTxEnvelope::Ethereum` we can access the signature directly.
 /// For unknown envelope types, we append nulls.
 fn append_signature_fields(t: &mut TransactionsBuilder, tx: &alloy::network::AnyRpcTransaction) {
-    // tx.inner = WithOtherFields<Transaction<AnyTxEnvelope>>
-    // tx.inner.inner = Recovered<AnyTxEnvelope> (Deref → AnyTxEnvelope)
-    // We go through as_envelope() when available, otherwise append nulls.
     if let Some(envelope) = tx.as_envelope() {
         let sig = envelope.signature();
-        // v: bool → u8 (0 or 1)
         t.v.append_value(u8::from(sig.v()));
-        // r: U256 → Binary (32 bytes big-endian)
         let r_bytes: [u8; 32] = sig.r().to_be_bytes();
         t.r.append_value(r_bytes);
-        // s: U256 → Binary (32 bytes big-endian)
         let s_bytes: [u8; 32] = sig.s().to_be_bytes();
         t.s.append_value(s_bytes);
     } else {
-        // Unknown envelope type — no signature available
         t.v.append_null();
         t.r.append_null();
         t.s.append_null();
@@ -824,7 +724,6 @@ pub fn traces_to_record_batch(traces: &[LocalizedTransactionTrace]) -> RecordBat
             Some(e) => t.error.append_value(e),
             None => t.error.append_null(),
         }
-        // sighash: first 4 bytes of input for call actions
         let sighash = match &trace.trace.action {
             Action::Call(call) if call.input.len() >= 4 => Some(&call.input[..4]),
             _ => None,
@@ -853,12 +752,8 @@ fn append_opt_binary(builder: &mut BinaryBuilder, val: Option<&[u8]>) {
 }
 
 // ---------------------------------------------------------------------------
-// Tx Receipts handlers: patch receipt-only columns into a transactions RecordBatch
+// Tx Receipts: patch receipt-only columns into a transactions RecordBatch
 // ---------------------------------------------------------------------------
-// Blocks, Logs, and Transactions are build-from-scratch to a RecordBatch, but
-// for Tx Receipts needs to be patched into the transactions batch.
-// It first build a compact index of receipt data by transaction hash, then
-// iterates through the transactions batch and fills in receipt fields when a matching receipt is found.
 
 /// A compact, indexable view of receipt data needed to populate receipt-only
 /// transaction columns.

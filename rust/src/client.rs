@@ -13,8 +13,13 @@ use crate::rpc::{
     start_block_stream, start_coordinated_stream, start_log_stream, start_trace_stream, RpcProvider,
 };
 
+/// An async stream of [`ArrowResponse`] chunks.
 pub type DataStream = Pin<Box<dyn Stream<Item = Result<ArrowResponse>> + Send + Sync>>;
 
+/// The main entry point for fetching EVM data over JSON-RPC.
+///
+/// Wraps an alloy RPC provider and routes queries to the appropriate
+/// pipeline (blocks, logs, traces, or a coordinated combination).
 #[derive(Debug, Clone)]
 pub struct Client {
     config: ClientConfig,
@@ -30,6 +35,7 @@ impl Client {
         Ok(Self { config, provider })
     }
 
+    /// Return a reference to the client's configuration.
     pub fn config(&self) -> &ClientConfig {
         &self.config
     }
@@ -279,22 +285,11 @@ mod tests {
                     ..BlockFields::default()
                 },
                 transaction: TransactionFields {
-                    // block_number: true,
                     hash: true,
-                    // from: true,
-                    // to: true,
-                    // value: true,
-                    // gas: true,
-                    // gas_price: true,
-                    // transaction_index: true,
                     ..TransactionFields::default()
                 },
-                log: LogFields {
-                    ..LogFields::default()
-                },
-                trace: TraceFields {
-                    ..TraceFields::default()
-                },
+                log: LogFields::default(),
+                trace: TraceFields::default(),
             },
         };
 
