@@ -21,10 +21,12 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY, DEFAULT_LOG_CHUNK_SIZE};
+use super::arrow_convert::{logs_to_record_batch, select_log_columns};
+use super::log_adaptive_concurrency::{
+    retry_logs_with_block_range, DEFAULT_LOG_CHUNK_SIZE, LOG_ADAPTIVE_CONCURRENCY,
+};
 use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use crate::config::ClientConfig;
-use super::arrow_convert::{logs_to_record_batch, select_log_columns};
 use crate::query::{LogFields, LogRequest};
 use crate::response::ArrowResponse;
 
@@ -49,10 +51,9 @@ pub(super) async fn run_log_historical(
     config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
-    let original_max_range = config
-        .batch_size
-        .map(|b| (b as u64).min(DEFAULT_LOG_CHUNK_SIZE))
-        .unwrap_or(DEFAULT_LOG_CHUNK_SIZE);
+    let original_max_range = config.batch_size.map_or(DEFAULT_LOG_CHUNK_SIZE, |b| {
+        (b as u64).min(DEFAULT_LOG_CHUNK_SIZE)
+    });
 
     // Set the original chunk size from config (persisted globally).
     LOG_ADAPTIVE_CONCURRENCY.set_original_chunk_size(original_max_range);
@@ -98,7 +99,8 @@ pub(super) async fn run_log_historical(
                 let result = fetch_logs(&task_provider, &task_log_requests, chunk_from, chunk_to)
                     .await
                     .map(|logs| {
-                        let logs_batch = select_log_columns(logs_to_record_batch(&logs), &log_fields);
+                        let logs_batch =
+                            select_log_columns(logs_to_record_batch(&logs), &log_fields);
                         ArrowResponse::with_logs(logs_batch)
                     });
 
@@ -224,7 +226,10 @@ pub(super) async fn run_log_live(
         let head = match provider.get_block_number().await {
             Ok(h) => h,
             Err(e) => {
-                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
+                error!(
+                    "Failed to get latest block number: {e:#}, retrying in {}ms",
+                    config.retry_backoff_ms
+                );
                 tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
                 continue;
             }
@@ -271,7 +276,9 @@ pub(super) async fn run_log_live(
                     continue;
                 }
 
-                if let Some(retry) = retry_logs_with_block_range(&err_str, from_block, to_block, None) {
+                if let Some(retry) =
+                    retry_logs_with_block_range(&err_str, from_block, to_block, None)
+                {
                     debug!(
                         "Live: block range error, will retry with {}-{}",
                         retry.from, retry.to
@@ -303,9 +310,7 @@ pub async fn fetch_logs(
         return Ok(Vec::new());
     }
 
-    info!(
-        "fetch_logs: requesting logs for blocks ({from_block}..={to_block})",
-    );
+    info!("fetch_logs: requesting logs for blocks ({from_block}..={to_block})",);
 
     let mut all_logs = Vec::new();
     for req in requests {

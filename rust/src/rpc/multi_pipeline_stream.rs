@@ -21,6 +21,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ClientConfig;
+
+type LogFetchResult = (u64, u64, Result<Vec<alloy::rpc::types::Log>>);
+type BlockFetchResult = (u64, u64, Result<Vec<AnyRpcBlock>>);
+
 use super::arrow_convert::{
     blocks_to_record_batch, logs_to_record_batch, merge_tx_receipts_into_batch,
     select_block_columns, select_log_columns, select_trace_columns, select_transaction_columns,
@@ -33,11 +37,11 @@ use crate::query::{
 use crate::response::ArrowResponse;
 
 use super::block_adaptive_concurrency::{retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY};
-use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use super::block_fetcher::fetch_blocks;
 use super::log_adaptive_concurrency::{retry_logs_with_block_range, LOG_ADAPTIVE_CONCURRENCY};
 use super::log_fetcher::fetch_logs;
 use super::provider::RpcProvider;
+use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use super::trace_fetcher::fetch_traces;
 use super::tx_receipt_fetcher::fetch_tx_receipts;
 
@@ -55,8 +59,7 @@ pub fn start_coordinated_stream(
     let (tx, rx) = mpsc::channel(config.buffer_size);
 
     tokio::spawn(async move {
-        if let Err(e) =
-            run_coordinated_stream(provider, query, config, pipelines, tx.clone()).await
+        if let Err(e) = run_coordinated_stream(provider, query, config, pipelines, tx.clone()).await
         {
             error!("Coordinated stream terminated with error: {e:#}");
             let _ = tx.send(Err(e)).await;
@@ -166,7 +169,10 @@ async fn run_coordinated_live(
         let head = match provider.get_block_number().await {
             Ok(h) => h,
             Err(e) => {
-                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
+                error!(
+                    "Failed to get latest block number: {e:#}, retrying in {}ms",
+                    config.retry_backoff_ms
+                );
                 tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
                 continue;
             }
@@ -228,8 +234,7 @@ async fn fetch_all(
         let block_fields = &query.fields.block;
         let tx_fields = &query.fields.transaction;
 
-        let blocks =
-            fetch_blocks_concurrent(provider, from_block, to_block, include_txs).await?;
+        let blocks = fetch_blocks_concurrent(provider, from_block, to_block, include_txs).await?;
         let blocks_batch = select_block_columns(blocks_to_record_batch(&blocks), block_fields);
         let raw_txs_batch = transactions_to_record_batch(&blocks);
 
@@ -244,7 +249,10 @@ async fn fetch_all(
 
         (blocks_batch, txs_batch)
     } else {
-        (ArrowResponse::empty().blocks, ArrowResponse::empty().transactions)
+        (
+            ArrowResponse::empty().blocks,
+            ArrowResponse::empty().transactions,
+        )
     };
 
     // --- Log pipeline ---
@@ -292,7 +300,7 @@ async fn fetch_logs_concurrent(
     }
 
     let cancel = CancellationToken::new();
-    let mut join_set: JoinSet<(u64, u64, Result<Vec<alloy::rpc::types::Log>>)> = JoinSet::new();
+    let mut join_set: JoinSet<LogFetchResult> = JoinSet::new();
     let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
     let mut all_logs: Vec<alloy::rpc::types::Log> = Vec::new();
 
@@ -444,7 +452,7 @@ async fn fetch_blocks_concurrent(
     }
 
     let cancel = CancellationToken::new();
-    let mut join_set: JoinSet<(u64, u64, Result<Vec<AnyRpcBlock>>)> = JoinSet::new();
+    let mut join_set: JoinSet<BlockFetchResult> = JoinSet::new();
     let mut retry_queue: VecDeque<(u64, u64)> = VecDeque::new();
     let mut all_blocks: Vec<AnyRpcBlock> = Vec::new();
 
@@ -571,4 +579,3 @@ async fn fetch_blocks_concurrent(
 
     Ok(all_blocks)
 }
-

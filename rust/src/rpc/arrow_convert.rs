@@ -7,9 +7,7 @@ use alloy::eips::Typed2718;
 use alloy::network::primitives::BlockTransactions;
 use alloy::network::{AnyRpcBlock, AnyTransactionReceipt, TransactionResponse};
 use alloy::primitives::{TxHash, B256, U128, U256};
-use alloy::rpc::types::trace::parity::{
-    Action, LocalizedTransactionTrace, TraceOutput,
-};
+use alloy::rpc::types::trace::parity::{Action, LocalizedTransactionTrace, TraceOutput};
 use alloy::rpc::types::Log;
 use arrow::array::{
     builder::{BinaryBuilder, Decimal256Builder},
@@ -272,19 +270,19 @@ fn append_withdrawals(wb: &mut tiders_evm_schema::WithdrawalsBuilder, block: &An
                 .values()
                 .field_builder::<arrow::array::builder::UInt64Builder>(0)
             {
-                fb.append_value(w.index)
+                fb.append_value(w.index);
             }
             if let Some(fb) = list_builder
                 .values()
                 .field_builder::<arrow::array::builder::UInt64Builder>(1)
             {
-                fb.append_value(w.validator_index)
+                fb.append_value(w.validator_index);
             }
             if let Some(fb) = list_builder.values().field_builder::<BinaryBuilder>(2) {
-                fb.append_value(w.address.as_slice())
+                fb.append_value(w.address.as_slice());
             }
             if let Some(fb) = list_builder.values().field_builder::<Decimal256Builder>(3) {
-                fb.append_value(u64_to_i256(w.amount))
+                fb.append_value(u64_to_i256(w.amount));
             }
             list_builder.values().append(true);
         }
@@ -535,7 +533,7 @@ fn append_access_list(
         for item in access_list.iter() {
             // Sub-builders: 0 = address (Binary), 1 = storage_keys (List<Binary>)
             if let Some(fb) = list_builder.values().field_builder::<BinaryBuilder>(0) {
-                fb.append_value(item.address.as_slice())
+                fb.append_value(item.address.as_slice());
             }
 
             let storage_keys_builder = list_builder
@@ -812,7 +810,7 @@ pub fn traces_to_record_batch(traces: &[LocalizedTransactionTrace]) -> RecordBat
             None => t.transaction_hash.append_null(),
         }
         match trace.transaction_position {
-            Some(p) => t.transaction_position.append_value(p as u64),
+            Some(p) => t.transaction_position.append_value(p),
             None => t.transaction_position.append_null(),
         }
         let type_str = match &trace.trace.action {
@@ -936,9 +934,8 @@ pub fn merge_tx_receipts_into_batch(
 
     // Collect the tx hashes column to drive the join.
     let schema = txs_batch.schema();
-    let hash_col_idx = match schema.index_of("hash") {
-        Ok(i) => i,
-        Err(_) => return txs_batch, // no hash column — nothing to merge
+    let Ok(hash_col_idx) = schema.index_of("hash") else {
+        return txs_batch; // no hash column — nothing to merge
     };
 
     let hash_col = txs_batch
@@ -946,9 +943,8 @@ pub fn merge_tx_receipts_into_batch(
         .as_any()
         .downcast_ref::<arrow::array::BinaryArray>();
 
-    let hash_col = match hash_col {
-        Some(c) => c,
-        None => return txs_batch,
+    let Some(hash_col) = hash_col else {
+        return txs_batch;
     };
 
     // Collect per-row receipt values (or None when no receipt found).
@@ -988,25 +984,22 @@ pub fn merge_tx_receipts_into_batch(
             continue;
         };
 
-        match index.get(&hash) {
-            Some(r) => {
-                cum_gas.push(Some(r.cumulative_gas_used));
-                eff_price.push(Some(r.effective_gas_price));
-                gas_used.push(Some(r.gas_used));
-                contract_addr.push(r.contract_address.map(|a| a.to_vec()));
-                bloom.push(Some(r.logs_bloom.to_vec()));
-                root.push(r.root.map(|b| b.to_vec()));
-                status.push(r.status);
-            }
-            None => {
-                cum_gas.push(None);
-                eff_price.push(None);
-                gas_used.push(None);
-                contract_addr.push(None);
-                bloom.push(None);
-                root.push(None);
-                status.push(None);
-            }
+        if let Some(r) = index.get(&hash) {
+            cum_gas.push(Some(r.cumulative_gas_used));
+            eff_price.push(Some(r.effective_gas_price));
+            gas_used.push(Some(r.gas_used));
+            contract_addr.push(r.contract_address.map(|a| a.to_vec()));
+            bloom.push(Some(r.logs_bloom.to_vec()));
+            root.push(r.root.map(|b| b.to_vec()));
+            status.push(r.status);
+        } else {
+            cum_gas.push(None);
+            eff_price.push(None);
+            gas_used.push(None);
+            contract_addr.push(None);
+            bloom.push(None);
+            root.push(None);
+            status.push(None);
         }
     }
 
@@ -1014,6 +1007,10 @@ pub fn merge_tx_receipts_into_batch(
     let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = txs_batch.columns().to_vec();
 
     let patch_decimal = |vals: &[Option<i256>]| -> std::sync::Arc<dyn arrow::array::Array> {
+        #[expect(
+            clippy::expect_used,
+            reason = "precision 76 is always valid for Decimal256"
+        )]
         let mut b = Decimal256Builder::new()
             .with_precision_and_scale(76, 0)
             .expect("valid decimal precision");
@@ -1065,6 +1062,10 @@ pub fn merge_tx_receipts_into_batch(
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "columns were taken from the same batch schema; type mismatch is a programmer error"
+    )]
     RecordBatch::try_new(txs_batch.schema(), columns)
         .expect("merge_tx_receipts_into_batch: column count/type mismatch")
 }
@@ -1243,6 +1244,10 @@ fn select_columns(batch: RecordBatch, requested: &[(&str, bool)]) -> RecordBatch
         .filter_map(|(name, _)| schema.index_of(name).ok())
         .collect();
 
+    #[expect(
+        clippy::expect_used,
+        reason = "indices are built from schema.index_of which only returns valid indices"
+    )]
     batch
         .project(&indices)
         .expect("project_columns: column index out of range")

@@ -23,12 +23,12 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use tokio::sync::{mpsc, Semaphore};
 
+use super::arrow_convert::{select_trace_columns, traces_to_record_batch};
+use super::shared_helpers::{is_fatal_error, is_rate_limit_error};
 use super::single_block_adaptive_concurrency::{
     report_rpc_outcome, DEFAULT_SINGLE_BLOCK_CHUNK_SIZE, SINGLE_BLOCK_ADAPTIVE_CONCURRENCY,
 };
-use super::shared_helpers::{is_fatal_error, is_rate_limit_error};
 use crate::config::ClientConfig;
-use super::arrow_convert::{select_trace_columns, traces_to_record_batch};
 use crate::query::{TraceFields, TraceMethod};
 use crate::response::ArrowResponse;
 
@@ -51,8 +51,7 @@ pub(super) async fn run_trace_historical(
 ) -> Result<u64> {
     let chunk_size = config
         .batch_size
-        .map(|b| b as u64)
-        .unwrap_or(DEFAULT_SINGLE_BLOCK_CHUNK_SIZE);
+        .map_or(DEFAULT_SINGLE_BLOCK_CHUNK_SIZE, |b| b as u64);
     let mut from_block = start_from;
 
     while from_block <= snapshot_latest_block {

@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use log::{info, warn};
-use once_cell::sync::Lazy;
 use rand::Rng;
+use std::sync::LazyLock;
 
 use super::shared_helpers::{
     halved_block_range, is_fatal_error_lower, pick_min_range, truncate_and_lowercase,
@@ -23,7 +23,7 @@ use super::shared_helpers::{
 pub const DEFAULT_BLOCK_CHUNK_SIZE: u64 = 200;
 
 /// Global adaptive concurrency controller for block pipeline batch calls.
-pub static BLOCK_ADAPTIVE_CONCURRENCY: Lazy<BlockAdaptiveConcurrency> = Lazy::new(|| {
+pub static BLOCK_ADAPTIVE_CONCURRENCY: LazyLock<BlockAdaptiveConcurrency> = LazyLock::new(|| {
     BlockAdaptiveConcurrency::new(
         10,  // initial concurrent calls
         2,   // minimum
@@ -191,7 +191,6 @@ impl BlockAdaptiveConcurrency {
         }
     }
 }
-
 
 /// Result of attempting to parse an error for a suggested block range.
 #[derive(Debug)]

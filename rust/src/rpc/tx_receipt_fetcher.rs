@@ -20,12 +20,12 @@ use anyhow::{Context, Result};
 use log::{error, info, warn};
 use tokio::sync::Semaphore;
 
+use super::provider::RpcProvider;
+use super::shared_helpers::{is_fatal_error, is_rate_limit_error};
 use super::single_block_adaptive_concurrency::{
     report_rpc_outcome, SINGLE_BLOCK_ADAPTIVE_CONCURRENCY,
 };
-use super::shared_helpers::{is_fatal_error, is_rate_limit_error};
 use crate::config::ClientConfig;
-use super::provider::RpcProvider;
 
 /// Fetch all tx receipts for a contiguous range of blocks.
 ///

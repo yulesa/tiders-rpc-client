@@ -16,17 +16,19 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::ClientConfig;
 use super::arrow_convert::{
     blocks_to_record_batch, merge_tx_receipts_into_batch, select_block_columns,
     select_transaction_columns, transactions_to_record_batch,
 };
+use crate::config::ClientConfig;
 use crate::query::{BlockFields, TransactionFields};
 use crate::response::ArrowResponse;
 
-use super::block_adaptive_concurrency::{retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY, DEFAULT_BLOCK_CHUNK_SIZE};
-use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
+use super::block_adaptive_concurrency::{
+    retry_block_with_block_range, BLOCK_ADAPTIVE_CONCURRENCY, DEFAULT_BLOCK_CHUNK_SIZE,
+};
 use super::provider::RpcProvider;
+use super::shared_helpers::{halved_block_range, is_fatal_error, is_rate_limit_error};
 use super::tx_receipt_fetcher::fetch_tx_receipts;
 
 /// Historical phase for the block pipeline: iterate `[from_block, snapshot_latest_block]`
@@ -36,6 +38,10 @@ use super::tx_receipt_fetcher::fetch_tx_receipts;
 /// adaptive concurrency controller. Each task fetches a chunk of blocks,
 /// optionally fetches tx receipts, converts to Arrow, and returns the response.
 /// Results are sent to the channel as they complete (no ordering guarantee).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all arguments are required for the block historical pipeline"
+)]
 pub(super) async fn run_block_historical(
     provider: &RpcProvider,
     include_txs: bool,
@@ -47,10 +53,9 @@ pub(super) async fn run_block_historical(
     config: &ClientConfig,
     tx: &mpsc::Sender<Result<ArrowResponse>>,
 ) -> Result<u64> {
-    let original_max_range = config
-        .batch_size
-        .map(|b| (b as u64).min(DEFAULT_BLOCK_CHUNK_SIZE))
-        .unwrap_or(DEFAULT_BLOCK_CHUNK_SIZE);
+    let original_max_range = config.batch_size.map_or(DEFAULT_BLOCK_CHUNK_SIZE, |b| {
+        (b as u64).min(DEFAULT_BLOCK_CHUNK_SIZE)
+    });
 
     // Set the original chunk size from config (persisted globally).
     BLOCK_ADAPTIVE_CONCURRENCY.set_original_chunk_size(original_max_range);
@@ -212,6 +217,10 @@ pub(super) async fn run_block_historical(
 }
 
 /// Live phase for the block pipeline: poll for new blocks.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all arguments are required for the block live pipeline"
+)]
 pub(super) async fn run_block_live(
     provider: &RpcProvider,
     include_txs: bool,
@@ -231,7 +240,10 @@ pub(super) async fn run_block_live(
         let head = match provider.get_block_number().await {
             Ok(h) => h,
             Err(e) => {
-                error!("Failed to get latest block number: {e:#}, retrying in {}ms", config.retry_backoff_ms);
+                error!(
+                    "Failed to get latest block number: {e:#}, retrying in {}ms",
+                    config.retry_backoff_ms
+                );
                 tokio::time::sleep(Duration::from_millis(config.retry_backoff_ms)).await;
                 continue;
             }
@@ -300,6 +312,10 @@ pub(super) async fn run_block_live(
 
 /// Single fetch task for blocks, transactions and receipts: fetch blocks,
 /// optionally fetch tx receipts, convert to Arrow.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all arguments are required for the block fetch task"
+)]
 async fn run_block_fetch_task(
     provider: &RpcProvider,
     from_block: u64,

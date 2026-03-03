@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use log::info;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 // Re-export for callers that import from this module.
 pub use super::shared_helpers::is_rate_limit_error;
 
@@ -24,7 +24,7 @@ pub const DEFAULT_SINGLE_BLOCK_CHUNK_SIZE: u64 = 200;
 /// The first time any call site reads current() or calls wait_for_backoff(),
 /// Lazy runs the closure and constructs the singleton. After that, every
 /// subsequent access returns the same instance.
-pub static SINGLE_BLOCK_ADAPTIVE_CONCURRENCY: Lazy<AdaptiveConcurrency> = Lazy::new(|| {
+pub static SINGLE_BLOCK_ADAPTIVE_CONCURRENCY: LazyLock<AdaptiveConcurrency> = LazyLock::new(|| {
     AdaptiveConcurrency::new(
         100,  // initial concurrent calls
         10,   // minimum
@@ -174,7 +174,6 @@ pub fn report_rpc_outcome(result: &Result<(), &str>) {
         }
     }
 }
-
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
