@@ -20,7 +20,7 @@ pub struct ClientConfig {
     pub req_timeout_millis: u64,
     /// Compute-unit rate limit for alloy's `RetryBackoffLayer`.
     pub compute_units_per_second: Option<u64>,
-    /// Number of blocks per batch. Controls memory usage in multi-pipeline mode.
+    /// Initial number of blocks per batch in simple pipeline mode; Response size (in blocks) in multi-pipeline mode (impact memory usage).
     pub batch_size: Option<usize>,
     /// Override the trace method for all trace requests.
     pub trace_method: Option<TraceMethod>,
