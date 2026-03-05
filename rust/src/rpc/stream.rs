@@ -76,7 +76,7 @@ async fn run_log_stream(
     info!("Finished historical log indexing up to block {snapshot_latest_block}");
 
     // Live phase
-    if !config.stop_on_head {
+    if !config.stop_on_head && query.to_block.is_none() {
         run_log_live(
             &provider,
             &query.logs,
@@ -152,7 +152,7 @@ async fn run_block_stream(
 
     info!("Finished historical block indexing up to block {snapshot_latest_block}");
 
-    if !config.stop_on_head {
+    if !config.stop_on_head && query.to_block.is_none() {
         run_block_live(
             &provider,
             include_txs,
@@ -230,7 +230,7 @@ async fn run_trace_stream(
 
     info!("Finished historical trace indexing up to block {snapshot_latest_block}");
 
-    if !config.stop_on_head {
+    if !config.stop_on_head && query.to_block.is_none() {
         run_trace_live(
             &provider,
             trace_method,
