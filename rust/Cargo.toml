@@ -1,6 +1,6 @@
 [package]
 name = "tiders-rpc-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A tiders RPC client for fetching EVM blockchain data from any standard JSON-RPC provider"
 homepage = "https://github.com/yulesa/tiders-rpc-client"

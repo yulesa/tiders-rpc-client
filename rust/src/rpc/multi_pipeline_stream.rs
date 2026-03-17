@@ -100,7 +100,7 @@ async fn run_coordinated_stream(
 
     info!("Finished historical coordinated indexing up to block {snapshot_latest_block}");
 
-    if !config.stop_on_head {
+    if !config.stop_on_head && query.to_block.is_none() {
         run_coordinated_live(&provider, &query, pipelines, next_block, &config, &tx).await?;
     }
 
