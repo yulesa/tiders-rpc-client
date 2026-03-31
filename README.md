@@ -1,8 +1,9 @@
 # tiders-rpc-client
 
+[![Documentation](https://img.shields.io/badge/documentation-blue?style=for-the-badge&logo=readthedocs)](https://yulesa.github.io/tiders-docs/)
 [![Crates.io](https://img.shields.io/badge/crates.io-orange?style=for-the-badge&logo=rust)](https://crates.io/crates/tiders-rpc-client)
 [![GitHub](https://img.shields.io/badge/github-black?style=for-the-badge&logo=github)](https://github.com/yulesa/tiders)
-[![Documentation](https://img.shields.io/badge/documentation-blue?style=for-the-badge&logo=readthedocs)](https://yulesa.github.io/tiders-docs/)
+[![telegram](https://img.shields.io/badge/telegram-blue?style=for-the-badge&logo=telegram)](https://t.me/tidersindexer)
 
 Rust library for fetching EVM blockchain data from any standard JSON-RPC endpoint and converting it to [Apache Arrow](https://arrow.apache.org/) format. Works with any Ethereum-compatible provider (Alchemy, Infura, QuickNode, local nodes, public endpoints, etc.).
 
