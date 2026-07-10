@@ -310,7 +310,7 @@ pub async fn fetch_logs(
         return Ok(Vec::new());
     }
 
-    info!("fetch_logs: requesting logs for blocks ({from_block}..={to_block})",);
+    info!("fetch_logs: requesting logs for blocks ({from_block}..={to_block})");
 
     let mut all_logs = Vec::new();
     for req in requests {
